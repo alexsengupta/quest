@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Solar system over a grid (A-Frame)</title>
+    <script src="https://aframe.io/releases/1.7.0/aframe.min.js"></script>
+    <script>
+      // Small custom component: draws a square grid of lines (size in metres, divisions = number of cells)
+      AFRAME.registerComponent('grid', {
+        schema: { size: {default: 40}, divisions: {default: 40} },
+        init: function () {
+          const g = new THREE.GridHelper(this.data.size, this.data.divisions, 0x66ccff, 0x2a4a6a);
+          this.el.setObject3D('grid', g);
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <!--
+      Units are metres. y is up, negative z is "in front of you".
+      On a Mac: drag to look around, WASD / arrow keys to move.
+      On a Quest: open the page in the browser and tap the VR button.
+
+      NOT TO SCALE: sizes and distances are compressed so everything fits.
+      Orbital periods ARE in the correct ratios (Earth = 12 s per orbit),
+      so Jupiter takes ~2.4 minutes and Saturn ~6 minutes per orbit.
+      The Moon's period is also in proportion (~0.9 s).
+    -->
+    <a-scene background="color: #05070d" renderer="antialias: true">
+
+      <!-- Lighting: dim ambient so night sides aren't fully black, plus the Sun as a point light -->
+      <a-entity light="type: ambient; color: #ffffff; intensity: 0.15"></a-entity>
+
+      <!-- Grid floor -->
+      <a-entity grid="size: 40; divisions: 40"></a-entity>
+
+      <!-- Solar system centre: everything below is positioned relative to this -->
+      <a-entity id="system" position="0 1.6 -5">
+
+        <!-- Sun: flat shader so it glows rather than being lit -->
+        <a-sphere radius="0.3" color="#ffcc33" material="shader: flat"></a-sphere>
+        <a-entity light="type: point; color: #fff3d6; intensity: 2; distance: 20; decay: 1"></a-entity>
+
+        <!-- Faint orbit rings -->
+        <a-ring rotation="-90 0 0" radius-inner="0.595" radius-outer="0.605" material="color: #ffffff; opacity: 0.2; transparent: true; side: double; shader: flat"></a-ring>
+        <a-ring rotation="-90 0 0" radius-inner="0.895" radius-outer="0.905" material="color: #ffffff; opacity: 0.2; transparent: true; side: double; shader: flat"></a-ring>
+        <a-ring rotation="-90 0 0" radius-inner="1.245" radius-outer="1.255" material="color: #ffffff; opacity: 0.2; transparent: true; side: double; shader: flat"></a-ring>
+        <a-ring rotation="-90 0 0" radius-inner="1.595" radius-outer="1.605" material="color: #ffffff; opacity: 0.2; transparent: true; side: double; shader: flat"></a-ring>
+        <a-ring rotation="-90 0 0" radius-inner="2.295" radius-outer="2.305" material="color: #ffffff; opacity: 0.2; transparent: true; side: double; shader: flat"></a-ring>
+        <a-ring rotation="-90 0 0" radius-inner="2.995" radius-outer="3.005" material="color: #ffffff; opacity: 0.2; transparent: true; side: double; shader: flat"></a-ring>
+
+        <!--
+          How the orbits work: each planet sits inside an invisible "pivot" entity at the Sun.
+          The pivot spins around the vertical (y) axis, carrying the planet around in a circle.
+          Starting rotations are staggered so the planets don't begin in a line.
+        -->
+
+        <!-- Mercury (0.24 yr) -->
+        <a-entity rotation="0 40 0" animation="property: rotation; from: 0 40 0; to: 0 400 0; dur: 2890; loop: true; easing: linear">
+          <a-sphere position="0.6 0 0" radius="0.04" color="#a9a9a9"></a-sphere>
+        </a-entity>
+
+        <!-- Venus (0.62 yr) -->
+        <a-entity rotation="0 150 0" animation="property: rotation; from: 0 150 0; to: 0 510 0; dur: 7380; loop: true; easing: linear">
+          <a-sphere position="0.9 0 0" radius="0.07" color="#e8c27a"></a-sphere>
+        </a-entity>
+
+        <!-- Earth (1 yr) with Moon -->
+        <a-entity rotation="0 260 0" animation="property: rotation; from: 0 260 0; to: 0 620 0; dur: 12000; loop: true; easing: linear">
+          <a-entity position="1.25 0 0">
+            <a-sphere radius="0.075" color="#3f7fd9"></a-sphere>
+            <!-- Moon pivot, centred on Earth -->
+            <a-entity animation="property: rotation; to: 0 360 0; dur: 900; loop: true; easing: linear">
+              <a-sphere position="0.14 0 0" radius="0.02" color="#d0d0d0"></a-sphere>
+            </a-entity>
+          </a-entity>
+        </a-entity>
+
+        <!-- Mars (1.88 yr) -->
+        <a-entity rotation="0 330 0" animation="property: rotation; from: 0 330 0; to: 0 690 0; dur: 22560; loop: true; easing: linear">
+          <a-sphere position="1.6 0 0" radius="0.05" color="#c1440e"></a-sphere>
+        </a-entity>
+
+        <!-- Jupiter (11.9 yr) -->
+        <a-entity rotation="0 90 0" animation="property: rotation; from: 0 90 0; to: 0 450 0; dur: 142400; loop: true; easing: linear">
+          <a-sphere position="2.3 0 0" radius="0.18" color="#d8a46b"></a-sphere>
+        </a-entity>
+
+        <!-- Saturn (29.5 yr) with tilted ring -->
+        <a-entity rotation="0 200 0" animation="property: rotation; from: 0 200 0; to: 0 560 0; dur: 354000; loop: true; easing: linear">
+          <a-entity position="3 0 0">
+            <a-sphere radius="0.15" color="#e3cf8f"></a-sphere>
+            <a-ring rotation="-63 0 0" radius-inner="0.2" radius-outer="0.32" material="color: #cdb98a; opacity: 0.8; transparent: true; side: double"></a-ring>
+          </a-entity>
+        </a-entity>
+
+        <!-- Label above the Sun -->
+        <a-text value="Not to scale. Orbital periods in true ratio (Earth = 12 s)" align="center" position="0 1.1 0" color="#ffffff" width="4"></a-text>
+      </a-entity>
+
+      <!-- Camera at standing eye height (1.6 m) -->
+      <a-entity camera look-controls wasd-controls position="0 1.6 0"></a-entity>
+
+    </a-scene>
+  </body>
+</html>
