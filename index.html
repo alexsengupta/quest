@@ -563,7 +563,7 @@ AFRAME.registerComponent('ui-slider', {
             label: { type: 'string' }, unit: { type: 'string', default: '' },
             width: { type: 'number', default: 0.56 }, enabledIf: { type: 'string', default: '' } },
   init: function () {
-    const d = this.data, w = d.width, o = this.el.object3D;
+    const d = this.data, w = d.width, o = new THREE.Group();
     this.el.classList.add('clickable');
     const basic = (col, opts) => new THREE.MeshBasicMaterial(Object.assign({ color: col, transparent: true }, opts || {}));
     this.label = makeCanvasPlane(w, 640, 52);
@@ -579,6 +579,7 @@ AFRAME.registerComponent('ui-slider', {
     this.knob.position.set(0, -0.018, 0.002); o.add(this.knob);
     const hit = new THREE.Mesh(new THREE.PlaneGeometry(w + 0.06, 0.1), basic('#ffffff', { opacity: 0, depthWrite: false }));
     hit.position.set(0, 0.005, 0.0005); o.add(hit);
+    this.el.setObject3D('ui', o);   // registers the meshes so controller / mouse rays can hit them
     this.hover = false; this.dragging = false; this.drawn = '';
     this.el.addEventListener('mouseenter', () => { this.hover = true; });
     this.el.addEventListener('mouseleave', () => { this.hover = false; });
@@ -586,14 +587,7 @@ AFRAME.registerComponent('ui-slider', {
       if (!this.enabled()) return;
       this.cursorEl = e.detail.cursorEl; this.dragging = true;
       this.setFromHit(e.detail.intersection);
-      const cam = document.querySelector('[camera]');
-      if (this.cursorEl === this.el.sceneEl && cam) cam.setAttribute('look-controls', 'enabled', false);
-      const up = () => {
-        this.dragging = false;
-        if (cam) cam.setAttribute('look-controls', 'enabled', true);
-        this.cursorEl.removeEventListener('mouseup', up);
-      };
-      this.cursorEl.addEventListener('mouseup', up);
+      holdLook(this.cursorEl, () => { this.dragging = false; });
     });
   },
   enabled: function () { return !this.data.enabledIf || !!SIM.params[this.data.enabledIf]; },
@@ -629,13 +623,91 @@ AFRAME.registerComponent('ui-slider', {
   }
 });
 
+
+// While dragging with the mouse, stop the camera from rotating; call onUp when released
+function holdLook(cursorEl, onUp) {
+  const cam = document.querySelector('[camera]');
+  const mouse = cursorEl === cursorEl.sceneEl || cursorEl.tagName === 'A-SCENE';
+  if (mouse && cam) cam.setAttribute('look-controls', 'enabled', false);
+  const up = () => {
+    onUp();
+    if (mouse && cam) cam.setAttribute('look-controls', 'enabled', true);
+    cursorEl.removeEventListener('mouseup', up);
+  };
+  cursorEl.addEventListener('mouseup', up);
+}
+
+// ---------- Drag handle: point at it, hold the trigger (or mouse button) and move the panel ----------
+AFRAME.registerComponent('panel-grab', {
+  schema: { target: { type: 'selector' }, width: { type: 'number', default: 0.6 } },
+  init: function () {
+    this.el.classList.add('clickable');
+    this.c = makeCanvasPlane(this.data.width, 768, 80);
+    const grp = new THREE.Group(); grp.add(this.c.mesh);
+    this.el.setObject3D('ui', grp);
+    this.hover = false; this.dragging = false; this.drawn = '';
+    this.offset = new THREE.Vector3(); this.tmp = new THREE.Vector3(); this.cam = new THREE.Vector3();
+    this.el.addEventListener('mouseenter', () => { this.hover = true; });
+    this.el.addEventListener('mouseleave', () => { this.hover = false; });
+    this.el.addEventListener('mousedown', (e) => {
+      const hit = e.detail.intersection; if (!hit) return;
+      this.cursorEl = e.detail.cursorEl; this.dragging = true;
+      this.dist = hit.distance;
+      const panel = this.data.target.object3D;
+      panel.updateMatrixWorld(true);
+      this.offset.copy(panel.worldToLocal(hit.point.clone()));   // grab point in panel coordinates
+      holdLook(this.cursorEl, () => { this.dragging = false; });
+    });
+  },
+  tick: function () {
+    if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
+      const ray = this.cursorEl.components.raycaster.raycaster.ray;
+      const panel = this.data.target.object3D, parent = panel.parent;
+      const target = parent.worldToLocal(this.tmp.copy(ray.direction).multiplyScalar(this.dist).add(ray.origin));
+      // keep the panel facing the viewer as it moves
+      const camEl = this.el.sceneEl.camera.el;
+      camEl.object3D.getWorldPosition(this.cam); parent.worldToLocal(this.cam);
+      panel.rotation.y = Math.atan2(this.cam.x - target.x, this.cam.z - target.z);
+      panel.position.copy(target);
+      panel.updateMatrix();
+      const off = this.offset.clone().applyQuaternion(panel.quaternion);
+      panel.position.sub(off);
+    }
+    const key = this.hover + '' + this.dragging;
+    if (key === this.drawn) return;
+    this.drawn = key;
+    const c = this.c.ctx, on = this.hover || this.dragging;
+    c.clearRect(0, 0, 768, 80);
+    c.fillStyle = on ? '#3a86b8' : '#22324a'; roundRect(c, 4, 4, 760, 72, 36); c.fill();
+    c.fillStyle = COL.text; c.font = `600 32px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(this.dragging ? 'Moving… release to place' : '✥  Grab here to move panel', 384, 42);
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- In VR, raise or lower the scene to match the viewer's actual eye height ----------
+AFRAME.registerComponent('auto-height', {
+  schema: { target: { type: 'selector' } },
+  init: function () {
+    const v = new THREE.Vector3();
+    this.el.addEventListener('enter-vr', () => {
+      setTimeout(() => {
+        this.el.camera.el.object3D.getWorldPosition(v);
+        if (v.y > 0.4) this.data.target.object3D.position.y = v.y - 1.6;
+      }, 1000);
+    });
+    this.el.addEventListener('exit-vr', () => { this.data.target.object3D.position.y = 0; });
+  }
+});
+
 // ---------- Buttons ----------
 AFRAME.registerComponent('ui-button', {
   schema: { action: { type: 'string' }, width: { type: 'number', default: 0.27 } },
   init: function () {
     this.el.classList.add('clickable');
     this.c = makeCanvasPlane(this.data.width, 512, 124);
-    this.el.object3D.add(this.c.mesh);
+    const grp = new THREE.Group(); grp.add(this.c.mesh);
+    this.el.setObject3D('ui', grp);
     this.hover = false; this.drawn = '';
     this.el.addEventListener('mouseenter', () => { this.hover = true; });
     this.el.addEventListener('mouseleave', () => { this.hover = false; });
@@ -688,7 +760,7 @@ AFRAME.registerComponent('ui-button', {
              renderer="antialias: true; colorManagement: true"
              cursor="rayOrigin: mouse; fuse: false"
              raycaster="objects: .clickable; far: 20"
-             sim-runner star-field>
+             sim-runner star-field auto-height="target: #stage">
 
       <a-entity light="type: ambient; color: #9fb4d0; intensity: 0.3"></a-entity>
 
@@ -697,6 +769,9 @@ AFRAME.registerComponent('ui-button', {
                 material="shader: flat; color: #0f1a2b; opacity: 0.9; transparent: true"></a-circle>
       <a-ring radius-inner="0.98" radius-outer="1.02" rotation="-90 0 0" position="0 0.004 0"
               material="shader: flat; color: #2f7fb8"></a-ring>
+
+      <!-- Everything in #stage is shifted up or down in VR to match your eye height -->
+      <a-entity id="stage">
 
       <!-- Earth, Sun, atmosphere and flux particles -->
       <a-entity planet-system position="0 1.85 -2.6"></a-entity>
@@ -712,7 +787,8 @@ AFRAME.registerComponent('ui-button', {
                 position="1.35 1.9 -2.4"></a-entity>
 
       <!-- Control panel -->
-      <a-entity id="panel" position="0.55 1.12 -1.1" rotation="-30 -20 0">
+      <a-entity id="panel" position="0.6 1.0 -1.3" rotation="-35 -28 0">
+        <a-entity panel-grab="target: #panel; width: 0.6" position="0 0.37 0.002"></a-entity>
         <a-plane width="1.46" height="0.66" position="0 0 -0.004" material="shader: flat; color: #2a3b55"></a-plane>
         <a-plane width="1.44" height="0.64" position="0 0 -0.002" material="shader: flat; color: #0b1320"></a-plane>
 
@@ -731,6 +807,8 @@ AFRAME.registerComponent('ui-button', {
         <a-entity ui-button="action: ice" position="0.505 -0.135 0.002"></a-entity>
         <a-entity ui-button="action: pause" position="0.215 -0.225 0.002"></a-entity>
         <a-entity ui-button="action: reset" position="0.505 -0.225 0.002"></a-entity>
+      </a-entity>
+
       </a-entity>
 
       <!-- Camera and Quest controllers (laser pointers) -->
