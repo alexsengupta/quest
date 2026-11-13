@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Fish School in 3D (VR)</title>
+    <title>Fish School (VR)</title>
     <script src="https://aframe.io/releases/1.7.0/aframe.min.js"></script>
     <script>
 // ===================== MODEL (no graphics) =====================
@@ -18,6 +18,12 @@
 // The ocean wraps around horizontally in a 22 m square centred on the viewer, so there are no
 // side walls for schools to bump into; the seam sits deep in the haze where it cannot be seen.
 // Vertically, fish stay between the seabed and the surface and prefer to swim level.
+// Two responses to danger (p.herd):
+//   flee (0):         social rules weaken and each alarmed fish steers directly away from the threat.
+//   selfish herd (1): alarmed fish draw closer to their neighbours instead (Hamilton 1971): cohesion
+//                     strengthens, alignment weakens and personal space shrinks; a fish only darts away
+//                     when a threat is very close. Together with predators that herd the school from
+//                     several sides (p.herdPreds), this produces a compact bait ball.
 const FIX = {
   BL: 0.2,            // body length (m)
   v0: 0.6,            // cruising speed (m/s) = 3 body lengths per second
@@ -109,7 +115,7 @@ Model.prototype.scatter = function () {
   const n = this.n; this.n = 0; this.t = 0;
   for (let i = 0; i < n; i++) this.addFish(false);
   for (let k = 0; k < this.preds.length; k++) this.preds[k] = this._newPred();
-  this.catches = 0; this.hist = []; this.histT = -1; this.scares = [];
+  this.catches = 0; this.hist = []; this.histT = -1; this.scares = []; this.herdC = null;
 };
 
 Model.prototype.scare = function (x, y, z) { this.scares.push({ x, y, z, life: 1.3 }); };
@@ -173,9 +179,11 @@ Model.prototype._cell = function (x, y, z) {
 };
 
 // Steering acceleration from the three social rules for fish i (written into this.acc)
-Model.prototype.social = function (i) {
+Model.prototype.social = function (i, u) {
   const p = this.p, L = FIX.L, hL = L / 2;
-  const R = p.R, R2 = R * R, Rs = Math.min(p.Rsep, R), Rs2 = Rs * Rs;
+  const h = p.herd && u > 0 ? Math.min(1, 2.5 * u) : 0;   // selfish-herd compaction when alarmed
+  const R = p.R, R2 = R * R, Rs = Math.min(p.Rsep, R) * (1 - 0.45 * h), Rs2 = Rs * Rs;
+  const wa = p.ali * (1 - 0.9 * h), wc = p.coh * (1 + 4 * h);
   const cosBlind = Math.cos(Math.PI - p.blind * Math.PI / 360);   // blind = full width of the blind cone (degrees)
   const useBlind = p.blind > 0.5;
   const xi = this.x[i], yi = this.y[i], zi = this.z[i], vxi = this.vx[i], vyi = this.vy[i], vzi = this.vz[i];
@@ -216,9 +224,9 @@ Model.prototype.social = function (i) {
   const v0 = FIX.v0, a = this.acc;
   let ax = p.sep * sx, ay = p.sep * sy, az = p.sep * sz;
   if (n > 0) {
-    ax += p.ali * (svx / n - vxi) / v0 + p.coh * (sdx / n) / R;
-    ay += p.ali * (svy / n - vyi) / v0 + p.coh * (sdy / n) / R;
-    az += p.ali * (svz / n - vzi) / v0 + p.coh * (sdz / n) / R;
+    ax += wa * (svx / n - vxi) / v0 + wc * (sdx / n) / R;
+    ay += wa * (svy / n - vyi) / v0 + wc * (sdy / n) / R;
+    az += wa * (svz / n - vzi) / v0 + wc * (sdz / n) / R;
   }
   const g = FIX.gain * v0; ax *= g; ay *= g; az *= g;
   const f = Math.sqrt(ax * ax + ay * ay + az * az), mf = (p.turn || FIX.aMax) * v0;
@@ -262,23 +270,25 @@ Model.prototype.step = function () {
 
   // 1. Every fish decides from the same snapshot
   for (let i = 0; i < n; i++) {
-    const a = this.social(i);
-    let ax = a[0], ay = a[1], az = a[2];
     const s = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]) || 1;
-    let u = 0, fx = 0, fy = 0, fz = 0;
+    let u = 0, fx = 0, fy = 0, fz = 0, dmin = 1e9;
     for (let k = 0; k < src.length; k++) {
       const dx = this.wrapD(x[i] - src[k].x), dy = y[i] - src[k].y, dz = this.wrapD(z[i] - src[k].z);
       const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      if (d < fearR && d > 1e-6) { const w = 1 - d / fearR; fx += dx / d * w; fy += dy / d * w; fz += dz / d * w; if (w > u) u = w; }
+      if (d < fearR && d > 1e-6) { const w = 1 - d / fearR; fx += dx / d * w; fy += dy / d * w; fz += dz / d * w; if (w > u) u = w; if (d < dmin) dmin = d; }
     }
+    const a = this.social(i, u);
+    let ax = a[0], ay = a[1], az = a[2];
     const rel = FIX.relax * (v0 * (1 + 0.6 * u) - s);
     ax += rel * vx[i] / s; ay += rel * vy[i] / s; az += rel * vz[i] / s;
-    if (u > 0) {   // alarmed: the social rules weaken and an escape force steers away from the threat
+    // flee: escape scales with alarm. Selfish herd: only a short dart when the threat is within 40% of fearR
+    const ue = this.p.herd ? Math.max((this.p.herdEsc || 0.8) * u, 1 - dmin / (0.4 * fearR)) : u;
+    if (ue > 0) {
       const fm = Math.sqrt(fx * fx + fy * fy + fz * fz) || 1, sp = v0 * (1 + 0.6 * u);
       let ex = fx / fm * sp - vx[i], ey = fy / fm * sp - vy[i], ez = fz / fm * sp - vz[i];
-      const em = Math.sqrt(ex * ex + ey * ey + ez * ez), cap = mf * FIX.escape * u;
+      const em = Math.sqrt(ex * ex + ey * ey + ez * ez), cap = mf * FIX.escape * ue;
       if (em > cap) { ex *= cap / em; ey *= cap / em; ez *= cap / em; }
-      ax = ax * (1 - 0.8 * u) + ex; ay = ay * (1 - 0.8 * u) + ey; az = az * (1 - 0.8 * u) + ez;
+      ax = ax * (1 - 0.8 * ue) + ex; ay = ay * (1 - 0.8 * ue) + ey; az = az * (1 - 0.8 * ue) + ez;
     }
     ax += (Math.random() - 0.5) * noise; ay += (Math.random() - 0.5) * noise * 0.5; az += (Math.random() - 0.5) * noise;
     this.environment(x[i], y[i], z[i], vy[i], env);
@@ -294,7 +304,9 @@ Model.prototype.step = function () {
     this.px[i] = x[i]; this.py[i] = y[i]; this.pz[i] = z[i];
     x[i] += nvx * dt; y[i] = Math.min(6.2, Math.max(0.12, y[i] + nvy * dt)); z[i] += nvz * dt;
   }
-  for (const pr of this.preds) this._stepPred(pr);
+  this.orbit = (this.orbit || 0) + dt * 0.25;
+  if (this.p.herdPreds && this.preds.length) this._trackHerd();
+  this.preds.forEach((pr, k) => this._stepPred(pr, k));
   for (let k = this.scares.length - 1; k >= 0; k--) if ((this.scares[k].life -= dt) <= 0) this.scares.splice(k, 1);
   this.t += dt;
   if (this.t - this.histT >= 0.25) {
@@ -362,6 +374,12 @@ Model.prototype.order = function () {
   this.polar = Math.sqrt(hx * hx + hy * hy + hz * hz) / k;
   this.mill = Math.sqrt(mx * mx + my * my + mz * mz) / k;
   this.local = Lc / k;
+  let r2 = 0;
+  for (let q = 0; q < k; q++) {
+    const i = mem[q], rx = this.wrapD(this.x[i] - this.x[ref]) - cx, ry = this.y[i] - cy, rz = this.wrapD(this.z[i] - this.z[ref]) - cz;
+    r2 += rx * rx + ry * ry + rz * rz;
+  }
+  this.radius = Math.sqrt(r2 / k);          // radius of gyration of the largest school (m)
   this.centre = [this.x[ref] + cx, cy, this.z[ref] + cz];
 };
 
@@ -377,19 +395,55 @@ Model.prototype._chooseTarget = function (pr) {
   return best;
 };
 
-Model.prototype._stepPred = function (pr) {
+// Herding predators work together on one school: they follow the centre of the fish within 3.5 m
+// of their current herd centre (starting from the largest school), and its size.
+Model.prototype._trackHerd = function () {
+  if (!this.herdC) { if (!this.centre) return; this.herdC = this.centre.slice(); }
+  const c = this.herdC, R2 = 3.5 * 3.5;
+  let sx = 0, sy = 0, sz = 0, k = 0, hx = 0, hz = 0;
+  for (let i = 0; i < this.n; i++) {
+    const dx = this.wrapD(this.x[i] - c[0]), dy = this.y[i] - c[1], dz = this.wrapD(this.z[i] - c[2]);
+    if (dx * dx + dy * dy + dz * dz < R2) { sx += dx; sy += dy; sz += dz; k++; hx += this.vx[i]; hz += this.vz[i]; }
+  }
+  if (k < 8) { this.herdC = this.centre ? this.centre.slice() : null; this.herdN = 0; return; }
+  c[0] += sx / k; c[1] += sy / k; c[2] += sz / k;
+  let r2 = 0;
+  for (let i = 0; i < this.n; i++) {
+    const dx = this.wrapD(this.x[i] - c[0]), dy = this.y[i] - c[1], dz = this.wrapD(this.z[i] - c[2]);
+    const d2 = dx * dx + dy * dy + dz * dz; if (d2 < R2) r2 += d2;
+  }
+  this.herdN = k; this.herdR = Math.sqrt(r2 / k);
+  this.herdH = Math.atan2(hz, hx);       // the school's heading: one predator always cuts across its path
+};
+
+Model.prototype._stepPred = function (pr, idx) {
   const dt = FIX.dt, env = this._env;
   let cap = FIX.predSpeed, tx, ty, tz, hunting = false;
   pr.px = pr.x; pr.py = pr.y; pr.pz = pr.z;
   if (pr.handle > 0) pr.handle -= dt;
-  else {
+  else if (this.p.herdPreds && !(pr.lunge > 0)) {
+    // Herding: circle the largest school on a ring outside it, spread evenly; now and then one lunges in
+    pr.nextLunge = (pr.nextLunge === undefined ? 4 + 6 * Math.random() : pr.nextLunge) - dt;
+    if (pr.nextLunge <= 0 && this.herdC) { pr.lunge = 4; pr.nextLunge = 6 + 6 * Math.random(); pr.target = -1; }
+    else if (this.herdC) {
+      const np = this.preds.length, nr = np > 3 ? np - 1 : np, th = (this.herdH || 0) + 2 * Math.PI * (idx % nr) / nr;
+      const rad = (this.herdR || 1) + 1.1, c = this.herdC;
+      const lift = np > 3 && idx === np - 1 ? -1.2 : 0;           // with four, one predator works from below
+      tx = this.wrapD(c[0] + rad * Math.cos(th) - pr.x); ty = c[1] + lift - pr.y; tz = this.wrapD(c[2] + rad * Math.sin(th) - pr.z);
+      const dd = Math.sqrt(tx * tx + ty * ty + tz * tz);
+      cap = Math.min(FIX.predSpeed * 2.2, 0.6 + dd * 1.5);        // herding predators are quick, and slow on arrival
+      hunting = true;
+    }
+  }
+  if (pr.handle <= 0 && !(this.p.herdPreds && !(pr.lunge > 0))) {
+    if (pr.lunge > 0) { pr.lunge -= dt; if (pr.lunge <= 0) pr.target = -1; }
     if (pr.target >= this.n) pr.target = -1;
     if (pr.target < 0 || (pr.retarget -= dt) <= 0) { pr.target = this._chooseTarget(pr); pr.retarget = FIX.retarget; }
     if (pr.target >= 0) {
       const i = pr.target, dx = this.wrapD(this.x[i] - pr.x), dy = this.y[i] - pr.y, dz = this.wrapD(this.z[i] - pr.z);
       const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
       if (d > FIX.huntRange * 1.3) pr.target = -1;
-      else if (d < FIX.catchR) this._catch(pr, i);
+      else if (d < FIX.catchR) { this._catch(pr, i); pr.lunge = 0; }
       else {   // aim at where the target is heading
         const look = Math.min(d / cap, 1.0);
         tx = dx + this.vx[i] * look; ty = dy + this.vy[i] * look; tz = dz + this.vz[i] * look; hunting = true;
@@ -403,11 +457,11 @@ Model.prototype._stepPred = function (pr) {
   }
   const m = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
   let ax = tx / m * cap - pr.vx, ay = ty / m * cap - pr.vy, az = tz / m * cap - pr.vz;
-  const am = Math.sqrt(ax * ax + ay * ay + az * az), lim = FIX.predAcc;
+  const am = Math.sqrt(ax * ax + ay * ay + az * az), lim = FIX.predAcc * (this.p.herdPreds ? 4 : 1);
   if (am > lim) { ax *= lim / am; ay *= lim / am; az *= lim / am; }
   this.environment(pr.x, pr.y, pr.z, pr.vy, env);
   pr.vx += (ax + env[0]) * dt; pr.vy += (ay + env[1]) * dt; pr.vz += (az + env[2]) * dt;
-  const s = Math.sqrt(pr.vx ** 2 + pr.vy ** 2 + pr.vz ** 2), top = FIX.predSpeed * 1.2;
+  const s = Math.sqrt(pr.vx ** 2 + pr.vy ** 2 + pr.vz ** 2), top = FIX.predSpeed * (this.p.herdPreds ? 2.3 : 1.2);
   if (s > top) { pr.vx *= top / s; pr.vy *= top / s; pr.vz *= top / s; }
   if (hunting) pr.wa = Math.atan2(pr.vz, pr.vx);
   pr.x += pr.vx * dt; pr.y = Math.min(5.5, Math.max(0.4, pr.y + pr.vy * dt)); pr.z += pr.vz * dt;
@@ -431,10 +485,381 @@ Model.prototype._catch = function (pr, i) {
 };
 // ===================== MODEL-END =====================
 
+// ===================== 2D MODEL =====================
+// The model from the 2D flocking app, unchanged (world units; one body length = 8 units; one step = one frame at 60 Hz).
+// Wrapped in its own namespace so it can sit beside the 3D model.
+const Flat = (function () {
+'use strict';
+/* =====================================================================
+   MODEL-BEGIN  (pure simulation code; no DOM access, testable in Node)
+   ===================================================================== */
+var FIX = {
+  cruise: 3,          // preferred swimming speed, units per step
+  maxForce: 0.1,      // largest change in velocity per step (inertia / turning limit)
+  socialGain: 0.06,   // converts the (dimensionless) social forces into acceleration
+  speedRelax: 0.05,   // how quickly a fish returns to its cruising speed
+  bodyLength: 8,      // units
+  predSpeed: 5,
+  predForce: 0.08,
+  huntRange: 300,
+  retarget: 45,       // steps between target re-evaluation
+  catchR: 7,
+  handling: 90,       // steps a predator pauses after a catch
+  fearR: 110,
+  scareLife: 40
+};
+FIX.maxSpeed = FIX.cruise;
+
+function Model(W, H, p) {
+  this.p = p;          // live parameter object: sep, ali, coh, R, Rsep
+  this.W = W; this.H = H;
+  this.cap = 0;
+  this.n = 0;
+  this.preds = [];
+  this.scares = [];
+  this.catches = 0;
+  this.t = 0;
+  this.polar = 0;
+  this.hist = new Float32Array(900);
+  this.histLen = 0; this.histPos = 0;
+  this._grow(512);
+  this._gridKey = '';
+  this._tmp = { sx: 0, sy: 0 };
+  this.o = { n: 0, ns: 0, sepX: 0, sepY: 0, aliX: 0, aliY: 0, cohX: 0, cohY: 0,
+             cx: 0, cy: 0, avx: 0, avy: 0, list: null, sepList: null };
+}
+
+Model.prototype._grow = function (cap) {
+  var names = ['x', 'y', 'vx', 'vy', 'ax', 'ay', 'fear'];
+  for (var k = 0; k < names.length; k++) {
+    var a = new Float32Array(cap);
+    if (this[names[k]]) a.set(this[names[k]].subarray(0, this.n));
+    this[names[k]] = a;
+  }
+  var nb = new Uint16Array(cap); if (this.nb) nb.set(this.nb.subarray(0, this.n)); this.nb = nb;
+  this.cellOf = new Int32Array(cap);
+  this.cellIdx = new Int32Array(cap);
+  this.cap = cap;
+};
+
+Model.prototype.wrapD = function (d, L) {
+  return d > L * 0.5 ? d - L : (d < -L * 0.5 ? d + L : d);
+};
+
+Model.prototype.addFish = function (x, y, vx, vy) {
+  if (this.n >= this.cap) this._grow(this.cap * 2);
+  var i = this.n++;
+  var a = Math.random() * Math.PI * 2;
+  this.x[i] = x !== undefined ? x : Math.random() * this.W;
+  this.y[i] = y !== undefined ? y : Math.random() * this.H;
+  this.vx[i] = vx !== undefined ? vx : Math.cos(a) * FIX.maxSpeed;
+  this.vy[i] = vy !== undefined ? vy : Math.sin(a) * FIX.maxSpeed;
+  this.ax[i] = this.ay[i] = this.fear[i] = 0;
+  return i;
+};
+
+Model.prototype.setCount = function (n) {
+  while (this.n < n) this.addFish();
+  if (this.n > n) this.n = n;
+};
+
+Model.prototype.scatter = function () {
+  var n = this.n; this.n = 0;
+  for (var i = 0; i < n; i++) this.addFish();
+  for (var k = 0; k < this.preds.length; k++) this.preds[k] = this._newPred();
+  this.catches = 0; this.t = 0; this.histLen = 0; this.histPos = 0; this.scares = [];
+  this.polar = this.polarisation();
+};
+
+Model.prototype._newPred = function () {
+  var a = Math.random() * Math.PI * 2;
+  return { x: Math.random() * this.W, y: Math.random() * this.H,
+           vx: Math.cos(a) * FIX.predSpeed * 0.6, vy: Math.sin(a) * FIX.predSpeed * 0.6,
+           target: -1, retarget: 0, handle: 0 };
+};
+
+Model.prototype.setPredators = function (k) {
+  while (this.preds.length < k) this.preds.push(this._newPred());
+  this.preds.length = k;
+};
+
+Model.prototype.resize = function (W, H) {
+  var sx = W / this.W, sy = H / this.H;
+  for (var i = 0; i < this.n; i++) { this.x[i] *= sx; this.y[i] *= sy; }
+  for (var k = 0; k < this.preds.length; k++) { this.preds[k].x *= sx; this.preds[k].y *= sy; }
+  this.W = W; this.H = H;
+};
+
+Model.prototype.scare = function (x, y) {
+  this.scares.push({ x: x, y: y, life: FIX.scareLife });
+};
+
+// Uniform grid with cells at least R wide, so all neighbours lie in the 3x3 block.
+Model.prototype.buildGrid = function () {
+  var R = this.p.R;
+  var cols = Math.max(1, Math.floor(this.W / R));
+  var rows = Math.max(1, Math.floor(this.H / R));
+  var key = cols + 'x' + rows;
+  if (key !== this._gridKey) {
+    this._gridKey = key;
+    this.cols = cols; this.rows = rows;
+    this.cellStart = new Int32Array(cols * rows + 1);
+    this.cellFill = new Int32Array(cols * rows);
+    // Precompute the unique set of neighbouring cells (handles grids < 3 cells wide).
+    this.nbrCells = [];
+    for (var cy = 0; cy < rows; cy++) {
+      for (var cx = 0; cx < cols; cx++) {
+        var seen = {}, list = [];
+        for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) {
+          var c = ((cy + dy + rows) % rows) * cols + ((cx + dx + cols) % cols);
+          if (!seen[c]) { seen[c] = 1; list.push(c); }
+        }
+        this.nbrCells.push(new Int32Array(list));
+      }
+    }
+  }
+  var cw = this.W / cols, ch = this.H / rows, ncell = cols * rows;
+  var start = this.cellStart, fill = this.cellFill;
+  start.fill(0);
+  for (var i = 0; i < this.n; i++) {
+    var gx = Math.min(cols - 1, Math.max(0, Math.floor(this.x[i] / cw)));
+    var gy = Math.min(rows - 1, Math.max(0, Math.floor(this.y[i] / ch)));
+    var c2 = gy * cols + gx;
+    this.cellOf[i] = c2;
+    start[c2 + 1]++;
+  }
+  for (var k = 0; k < ncell; k++) start[k + 1] += start[k];
+  for (k = 0; k < ncell; k++) fill[k] = start[k];
+  for (i = 0; i < this.n; i++) this.cellIdx[fill[this.cellOf[i]]++] = i;
+};
+
+// Steering helper for predators: desired = speed * d/|d|; steer = desired - v, limited to maxF.
+Model.prototype._seek = function (dx, dy, vx, vy, speed, maxF) {
+  var t = this._tmp;
+  var m = Math.sqrt(dx * dx + dy * dy);
+  if (m < 1e-9) { t.sx = 0; t.sy = 0; return t; }
+  var sx = dx / m * speed - vx, sy = dy / m * speed - vy;
+  var f = Math.sqrt(sx * sx + sy * sy);
+  if (f > maxF) { sx *= maxF / f; sy *= maxF / f; }
+  t.sx = sx; t.sy = sy;
+  return t;
+};
+
+// The three social forces on fish i (unweighted, dimensionless), written into o.
+//   Separation: for each neighbour inside personal space, a unit push directly away
+//               from it, scaled by (1 - d/Rsep): zero at the edge, 1 when touching.
+//   Alignment:  (average neighbour velocity - own velocity) / cruise speed.
+//               Zero when already matching, larger the more mismatched.
+//   Cohesion:   (centre of neighbours - own position) / R.
+//               Points straight at the centre, stronger the further away it is.
+// If o.list / o.sepList are arrays, neighbour indices are recorded (for drawing).
+Model.prototype.steer = function (i, o) {
+  var x = this.x, y = this.y, vx = this.vx, vy = this.vy;
+  var W = this.W, H = this.H, hw = W * 0.5, hh = H * 0.5;
+  var R = this.p.R, R2 = R * R, Rs = Math.min(this.p.Rsep, R), Rs2 = Rs * Rs;
+  var xi = x[i], yi = y[i];
+  var n = 0, ns = 0, svx = 0, svy = 0, sdx = 0, sdy = 0, px = 0, py = 0;
+  var cells = this.nbrCells[this.cellOf[i]];
+  var start = this.cellStart, idx = this.cellIdx;
+  for (var k = 0; k < cells.length; k++) {
+    var c = cells[k], end = start[c + 1];
+    for (var m = start[c]; m < end; m++) {
+      var j = idx[m];
+      if (j === i) continue;
+      var dx = x[j] - xi; if (dx > hw) dx -= W; else if (dx < -hw) dx += W;
+      var dy = y[j] - yi; if (dy > hh) dy -= H; else if (dy < -hh) dy += H;
+      var d2 = dx * dx + dy * dy;
+      if (d2 >= R2) continue;
+      n++; svx += vx[j]; svy += vy[j]; sdx += dx; sdy += dy;
+      if (o.list) o.list.push(j);
+      if (d2 < Rs2 && d2 > 1e-12) {
+        var d = Math.sqrt(d2), w = (1 - d / Rs) / d;
+        px -= dx * w; py -= dy * w;
+        ns++;
+        if (o.sepList) o.sepList.push(j);
+      }
+    }
+  }
+  var cr = FIX.cruise;
+  o.n = n; o.ns = ns;
+  o.sepX = px; o.sepY = py;
+  o.aliX = o.aliY = o.cohX = o.cohY = o.cx = o.cy = o.avx = o.avy = 0;
+  if (n > 0) {
+    o.avx = svx / n; o.avy = svy / n;
+    o.aliX = (o.avx - vx[i]) / cr; o.aliY = (o.avy - vy[i]) / cr;
+    o.cx = sdx / n; o.cy = sdy / n;           // centre of neighbours, relative to fish i
+    o.cohX = o.cx / R; o.cohY = o.cy / R;
+  }
+  return o;
+};
+
+// Social acceleration of fish i (before any fear response): weighted sum of the
+// three forces, times socialGain, capped at maxForce, plus a gentle pull back
+// towards cruising speed. Written into o.accX / o.accY; o.pushX/Y is the uncapped push.
+Model.prototype.accel = function (i, o) {
+  var p = this.p;
+  this.steer(i, o);
+  var g = FIX.socialGain;
+  var ax = g * (p.sep * o.sepX + p.ali * o.aliX + p.coh * o.cohX);
+  var ay = g * (p.sep * o.sepY + p.ali * o.aliY + p.coh * o.cohY);
+  o.pushX = ax; o.pushY = ay;
+  var f = Math.sqrt(ax * ax + ay * ay), mf = FIX.maxForce;
+  if (f > mf) { ax *= mf / f; ay *= mf / f; }
+  var vx = this.vx[i], vy = this.vy[i], s = Math.sqrt(vx * vx + vy * vy) || 1;
+  var rel = FIX.speedRelax * (FIX.cruise - s);
+  o.accX = ax + rel * vx / s; o.accY = ay + rel * vy / s;
+  return o;
+};
+
+Model.prototype.step = function () {
+  var n = this.n, W = this.W, H = this.H;
+  var x = this.x, y = this.y, vx = this.vx, vy = this.vy, ax = this.ax, ay = this.ay;
+  var cr = FIX.cruise, mf = FIX.maxForce, fearR = FIX.fearR;
+  this.buildGrid();
+
+  // Threat sources: predators plus click/tap scares.
+  var src = [];
+  for (var k = 0; k < this.preds.length; k++) src.push(this.preds[k]);
+  for (k = 0; k < this.scares.length; k++) src.push(this.scares[k]);
+
+  // 1. Every fish computes its acceleration from the same snapshot.
+  var o = this.o; o.list = null; o.sepList = null;
+  for (var i = 0; i < n; i++) {
+    this.accel(i, o);
+    this.nb[i] = o.n;
+    var axi = o.accX, ayi = o.accY;
+    var u = 0, fx = 0, fy = 0;
+    for (k = 0; k < src.length; k++) {
+      var dx = this.wrapD(x[i] - src[k].x, W), dy = this.wrapD(y[i] - src[k].y, H);
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d < fearR && d > 1e-6) {
+        var w = 1 - d / fearR;
+        fx += dx / d * w; fy += dy / d * w;
+        if (w > u) u = w;
+      }
+    }
+    if (u > 0) {
+      var t = this._seek(fx, fy, vx[i], vy[i], cr * (1 + 0.5 * u), mf * 3 * u);
+      axi = axi * (1 - 0.8 * u) + t.sx;
+      ayi = ayi * (1 - 0.8 * u) + t.sy;
+    }
+    ax[i] = axi; ay[i] = ayi; this.fear[i] = u;
+  }
+
+  // 2. Then everyone moves.
+  for (i = 0; i < n; i++) {
+    var nvx = vx[i] + ax[i], nvy = vy[i] + ay[i];
+    var cap = cr * (1.5 + 0.5 * this.fear[i]);
+    var s = Math.sqrt(nvx * nvx + nvy * nvy);
+    if (s > cap) { nvx *= cap / s; nvy *= cap / s; }
+    vx[i] = nvx; vy[i] = nvy;
+    var nx = x[i] + nvx, ny = y[i] + nvy;
+    if (nx < 0) nx += W; else if (nx >= W) nx -= W;
+    if (ny < 0) ny += H; else if (ny >= H) ny -= H;
+    x[i] = nx; y[i] = ny;
+  }
+
+  // 3. Predators.
+  for (k = 0; k < this.preds.length; k++) this._stepPred(this.preds[k]);
+
+  // 4. Scares fade.
+  for (k = this.scares.length - 1; k >= 0; k--) if (--this.scares[k].life <= 0) this.scares.splice(k, 1);
+
+  // 5. Polarisation.
+  this.polar = this.polarisation();
+  this.hist[this.histPos] = this.polar;
+  this.histPos = (this.histPos + 1) % this.hist.length;
+  if (this.histLen < this.hist.length) this.histLen++;
+  this.t++;
+};
+
+Model.prototype.polarisation = function () {
+  var sx = 0, sy = 0, n = this.n;
+  if (!n) return 0;
+  for (var i = 0; i < n; i++) {
+    var s = Math.sqrt(this.vx[i] * this.vx[i] + this.vy[i] * this.vy[i]) || 1;
+    sx += this.vx[i] / s; sy += this.vy[i] / s;
+  }
+  return Math.sqrt(sx * sx + sy * sy) / n;
+};
+
+Model.prototype._chooseTarget = function (pr) {
+  var best = -1, bestScore = Infinity;
+  for (var i = 0; i < this.n; i++) {
+    var dx = this.wrapD(this.x[i] - pr.x, this.W), dy = this.wrapD(this.y[i] - pr.y, this.H);
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d > FIX.huntRange) continue;
+    var score = d - Math.max(0, 6 - this.nb[i]) * 25;   // isolated fish look closer
+    if (score < bestScore) { bestScore = score; best = i; }
+  }
+  return best;
+};
+
+Model.prototype._stepPred = function (pr) {
+  var W = this.W, H = this.H, sp = FIX.predSpeed, ax = 0, ay = 0, t, cap = sp;
+  if (pr.handle > 0) {
+    pr.handle--;
+    cap = sp * 0.45;
+    t = this._wander(pr, cap); ax = t.sx; ay = t.sy;
+  } else {
+    if (pr.target >= this.n) pr.target = -1;
+    if (pr.target < 0 || --pr.retarget <= 0) { pr.target = this._chooseTarget(pr); pr.retarget = FIX.retarget; }
+    if (pr.target >= 0) {
+      var i = pr.target;
+      var dx = this.wrapD(this.x[i] - pr.x, W), dy = this.wrapD(this.y[i] - pr.y, H);
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d > FIX.huntRange * 1.3) { pr.target = -1; }
+      else if (d < FIX.catchR) { this._catch(pr, i); }
+      else {
+        var look = Math.min(d / sp, 12);       // aim where the target is going
+        t = this._seek(dx + this.vx[i] * look, dy + this.vy[i] * look, pr.vx, pr.vy, sp, FIX.predForce);
+        ax = t.sx; ay = t.sy;
+      }
+    } else {
+      cap = sp * 0.6;
+      t = this._wander(pr, cap); ax = t.sx; ay = t.sy;
+    }
+  }
+  pr.vx += ax; pr.vy += ay;
+  var s = Math.sqrt(pr.vx * pr.vx + pr.vy * pr.vy);
+  if (s > cap) { pr.vx *= cap / s; pr.vy *= cap / s; }
+  pr.x += pr.vx; pr.y += pr.vy;
+  if (pr.x < 0) pr.x += W; else if (pr.x >= W) pr.x -= W;
+  if (pr.y < 0) pr.y += H; else if (pr.y >= H) pr.y -= H;
+};
+
+Model.prototype._wander = function (pr, speed) {
+  var a = Math.atan2(pr.vy, pr.vx) + (Math.random() - 0.5) * 0.5;
+  return this._seek(Math.cos(a), Math.sin(a), pr.vx, pr.vy, speed, FIX.predForce);
+};
+
+Model.prototype._catch = function (pr, i) {
+  this.catches++;
+  pr.handle = FIX.handling; pr.target = -1;
+  // Replace the fish at a random spot well away from every predator.
+  for (var tries = 0; tries < 20; tries++) {
+    var X = Math.random() * this.W, Y = Math.random() * this.H, ok = true;
+    for (var k = 0; k < this.preds.length; k++) {
+      var dx = this.wrapD(X - this.preds[k].x, this.W), dy = this.wrapD(Y - this.preds[k].y, this.H);
+      if (dx * dx + dy * dy < 200 * 200) { ok = false; break; }
+    }
+    if (ok || tries === 19) {
+      var a = Math.random() * Math.PI * 2;
+      this.x[i] = X; this.y[i] = Y;
+      this.vx[i] = Math.cos(a) * FIX.maxSpeed; this.vy[i] = Math.sin(a) * FIX.maxSpeed;
+      this.fear[i] = 0;
+      break;
+    }
+  }
+};
+return { Model: Model, FIX: FIX };
+})();
 
 // ===================== SETTINGS AND PRESETS =====================
+// Three views: 'ocean' (3D school all around you), 'tank' (the 2D model on a table, wrapping edges)
+// and 'tour' (step-by-step explainer of the rules, in the tank).
 const P = { sep: 1.5, ali: 1.0, coh: 1.0, R: 1.0, Rsep: 0.6, blind: 60, turnDeg: 115, turn: 2.0,
-            n: 500, preds: 0, speed: 1, paused: false };
+            herd: 0, herdPreds: 0, n: 500, preds: 0, speed: 1, paused: false };
 const PRESETS = {
   school: { sep: 1.5, ali: 1.0, coh: 1.0, R: 1.0, blind: 60, turnDeg: 115, preds: 0, name: 'School',
             text: 'Balanced rules. Fish gather into several schools that each swim in one direction, and merge or split as they meet.' },
@@ -442,29 +867,64 @@ const PRESETS = {
             text: 'Alignment switched off. Fish still clump together, and neighbours often end up heading roughly the same way anyway. Compare the neighbour alignment with School.' },
   loners: { sep: 1.5, ali: 0.0, coh: 0.0, R: 1.0, blind: 60, turnDeg: 115, preds: 0, name: 'Loners',
             text: 'No alignment and no cohesion. Fish only avoid bumping into each other: a baseline with no social behaviour.' },
-  mill:   { sep: 1.5, ali: 0.5, coh: 1.5, R: 2.0, blind: 140, turnDeg: 35, preds: 0, name: 'Mill around you',
+  mill:   { sep: 1.5, ali: 0.5, coh: 1.5, R: 2.0, blind: 140, turnDeg: 35, preds: 0, name: 'Mill around you', short: 'Mill',
             text: 'Slow turning, a wide blind angle and long-range attraction. Fish restart scattered; within about half a minute the school wraps around you and circles. In this model the mill needs an obstacle (you) at its centre.' },
   attack: { sep: 1.5, ali: 1.0, coh: 1.2, R: 1.1, blind: 60, turnDeg: 115, preds: 2, name: 'Under attack',
-            text: 'Two predators hunt, preferring fish with few neighbours. Watch schools split around a predator and then reform.' }
+            text: 'Two predators (orange) hunt, preferring fish with few neighbours. Fish flee directly away from them. Watch schools split around a predator and then reform.' },
+  bait:   { sep: 1.5, ali: 1.0, coh: 1.2, R: 1.1, blind: 60, turnDeg: 115, preds: 4, herd: 1, herdPreds: 1, name: 'Bait ball',
+            text: 'Selfish herd: alarmed fish move closer to their neighbours instead of fleeing, and dart only when a predator is very close. Four predators herd one school from all sides and take turns to lunge. The school packs into a tight, churning group; unlike real bait balls it keeps moving rather than milling in place.' }
 };
-const SIM = { model: null, preset: 'school', acc: 0, stepMs: 0, fps: 72, mode: 'main', panel: true };
+const SIM = { model: null, preset: 'school', acc: 0, stepMs: 0, fps: 72, mode: 'ocean', panel: true, hands: [] };
 const MAXN = 1000;
+
+// 2D tank: same settings and presets as the original 2D app (world units; 8 units = one body length)
+const BL2 = 8;
+const P2 = { sep: 1.5, ali: 1.0, coh: 1.0, R: 48, Rsep: 24, n: 70, preds: 0, speed: 1, paused: false };
+const PRESETS2 = {
+  balanced: { sep: 1.5, ali: 1.0, coh: 1.0, R: 48, Rsep: 24, preds: 0, name: 'Balanced',
+              text: 'Balanced rules. Fish gather into a few schools that each swim in one direction, and merge or split as they meet.' },
+  swarm:    { sep: 1.5, ali: 0.0, coh: 1.0, R: 48, Rsep: 24, preds: 0, name: 'Swarm',
+              text: 'Alignment switched off. Fish still gather into clusters, but each cluster mills about with no shared direction, like a swarm of midges.' },
+  parallel: { sep: 1.2, ali: 2.0, coh: 1.2, R: 72, Rsep: 20, preds: 0, name: 'Parallel',
+              text: 'Strong alignment and longer sight. Fish quickly form one or two tightly aligned schools, like sardines on the move.' },
+  loners:   { sep: 1.5, ali: 0.0, coh: 0.0, R: 48, Rsep: 24, preds: 0, name: 'Loners',
+              text: 'No alignment and no cohesion. Fish only avoid bumping into each other: a baseline with no social behaviour.' },
+  attack:   { sep: 1.5, ali: 1.0, coh: 1.2, R: 56, Rsep: 24, preds: 2, name: 'Under attack',
+              text: 'The balanced school plus two predators (orange). Watch the school split around a predator and then reform.' }
+};
+const TANK = { W: 600, H: 360, w: 2.4, d: 1.44 };   // model world (units) and table top (metres); edges wrap
+const SIM2 = { model: null, preset: 'balanced', acc: 0, px: new Float32Array(1024), py: new Float32Array(1024),
+               tour: { step: 0, model: null, playing: false, playLeft: 0, cx: 500, cy: 500, drag: -1 } };
 
 function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
 function applyPreset(key) {
   const pr = PRESETS[key];
   ['sep', 'ali', 'coh', 'R', 'blind', 'turnDeg', 'preds'].forEach(k => { P[k] = pr[k]; });
+  P.herd = pr.herd || 0; P.herdPreds = pr.herdPreds || 0;
   SIM.preset = key;
+  if (SIM.model) SIM.model.herdC = null;
+}
+function applyPreset2(key) {
+  const pr = PRESETS2[key];
+  ['sep', 'ali', 'coh', 'R', 'Rsep', 'preds'].forEach(k => { P2[k] = pr[k]; });
+  SIM2.preset = key;
 }
 function startModel() {
   const m = new Model(P);
   m.setCount(P.n); m.setPredators(P.preds);
+  m.hands = SIM.hands;
   SIM.model = m;
+}
+function startModel2() {
+  const m = new Flat.Model(TANK.W, TANK.H, P2);
+  m.setCount(P2.n); m.setPredators(P2.preds); m.scatter();
+  SIM2.model = m;
 }
 
 // ===================== DRAWING HELPERS =====================
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
-const COL = { text: '#e8eef6', muted: '#8fa3bf', panel: '#0d1726', P: '#ffd166', M: '#6fd3ff', L: '#7ee0a0', fear: '#ff7a5c' };
+const COL = { text: '#e8eef6', muted: '#8fa3bf', panel: '#0d1726', P: '#ffd166', M: '#6fd3ff', L: '#7ee0a0', fear: '#ff7a5c',
+              sep: '#f2754f', ali: '#5b9bf0', coh: '#2fbf86', focal: '#ff7ac0', ink: '#e6f1f6', pred: '#ff9a3c' };
 
 // A flat plane carrying a 2D canvas, used for all text in the scene
 function makeCanvasPlane(widthM, pxW, pxH) {
@@ -491,6 +951,28 @@ function wrapLines(ctx, text, maxW) {
   if (line) lines.push(line);
   return lines;
 }
+// Draws simple HTML (paragraphs <p> and bold <b>) with word wrap; returns the y after the last line
+function drawRich(ctx, html, x, y, maxW, size, lineH, col, boldCol) {
+  const paras = html.replace(/<span[^>]*><\/span>/g, '').replace(/&rarr;/g, '→').replace(/&times;/g, '×')
+    .split(/<\/p>\s*/).map(p => p.replace(/<p>/g, '').trim()).filter(Boolean);
+  for (const para of paras) {
+    const words = [];
+    para.split(/(<b>.*?<\/b>)/).forEach(seg => {
+      const bold = seg.startsWith('<b>');
+      seg.replace(/<\/?[^>]+>/g, '').split(/\s+/).filter(Boolean).forEach(w => words.push([w, bold]));
+    });
+    let cx = x;
+    for (const [w, bold] of words) {
+      ctx.font = `${bold ? '700 ' : ''}${size}px ${FONT}`;
+      const ww = ctx.measureText(w + ' ').width;
+      if (cx + ctx.measureText(w).width > x + maxW && cx > x) { cx = x; y += lineH; }
+      ctx.fillStyle = bold ? boldCol : col; ctx.fillText(w, cx, y);
+      cx += ww;
+    }
+    y += lineH * 1.45;
+  }
+  return y;
+}
 function mulberry32(a) {
   return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
     t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
@@ -506,7 +988,7 @@ function schoolState(m) {
 }
 
 // ===================== FISH GEOMETRY =====================
-// A low-poly fish, nose along +z, with countershading (dark back, silver belly) in vertex colours.
+// A low-poly fish, nose along +z, with countershading (dark back, pale belly) and coloured fins.
 function fishGeometry(len, back, belly, fin) {
   const rings = [[0.50, 0, 0], [0.34, 0.06, 0.09], [0.12, 0.085, 0.15], [-0.12, 0.06, 0.11], [-0.30, 0.025, 0.045], [-0.36, 0.012, 0.022]];
   const SEG = 8, pos = [], col = [];
@@ -537,12 +1019,12 @@ function fishGeometry(len, back, belly, fin) {
 }
 
 // Instanced mesh whose tail beats in the vertex shader (one draw call for every fish)
-function swimmingMesh(geom, maxCount, len, freq, amp) {
+function swimmingMesh(geom, maxCount, len, freq, amp, emissive) {
   const phase = new Float32Array(maxCount);
   for (let i = 0; i < maxCount; i++) phase[i] = Math.random() * 6.283;
   geom.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase, 1));
   const uTime = { value: 0 };
-  const mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  const mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, emissive: emissive || '#000000' });
   mat.onBeforeCompile = (sh) => {
     sh.uniforms.uTime = uTime;
     sh.vertexShader = sh.vertexShader
@@ -560,19 +1042,28 @@ function swimmingMesh(geom, maxCount, len, freq, amp) {
   return { mesh, uTime };
 }
 
-// Writes a pose (position + heading) into an instance matrix: the fish's +z points along (vx, vy, vz)
-function writePose(arr, i, x, y, z, vx, vy, vz) {
+// Writes a pose (position + heading, optional uniform scale) into an instance matrix:
+// the fish's +z points along (vx, vy, vz)
+function writePose(arr, i, x, y, z, vx, vy, vz, sc) {
+  sc = sc || 1;
   let s = Math.sqrt(vx * vx + vy * vy + vz * vz) || 1;
   const fx = vx / s, fy = vy / s, fz = vz / s;
   let rx = fz, rz = -fx;                              // right = up x forward, with up = (0, 1, 0)
   s = Math.sqrt(rx * rx + rz * rz) || 1; rx /= s; rz /= s;
   const ux = fy * rz, uy = fz * rx - fx * rz, uz = -fy * rx;   // up' = forward x right
   const o = i * 16;
-  arr[o] = rx; arr[o + 1] = 0; arr[o + 2] = rz; arr[o + 3] = 0;
-  arr[o + 4] = ux; arr[o + 5] = uy; arr[o + 6] = uz; arr[o + 7] = 0;
-  arr[o + 8] = fx; arr[o + 9] = fy; arr[o + 10] = fz; arr[o + 11] = 0;
+  arr[o] = rx * sc; arr[o + 1] = 0; arr[o + 2] = rz * sc; arr[o + 3] = 0;
+  arr[o + 4] = ux * sc; arr[o + 5] = uy * sc; arr[o + 6] = uz * sc; arr[o + 7] = 0;
+  arr[o + 8] = fx * sc; arr[o + 9] = fy * sc; arr[o + 10] = fz * sc; arr[o + 11] = 0;
   arr[o + 12] = x; arr[o + 13] = y; arr[o + 14] = z; arr[o + 15] = 1;
 }
+function hidePose(arr, i) { for (let k = 0; k < 16; k++) arr[i * 16 + k] = 0; }
+
+// Fish colours: dark slate back, white belly and yellow fins stand out against the blue water;
+// predators are orange so they are easy to pick out.
+const FISH_COLS = ['#2e3d45', '#f4f7f8', '#ffcf3f'];
+const PRED_COLS = ['#c4571f', '#ffd9a8', '#9a3b12'];
+const FISH2_COLS = ['#b9d3df', '#ffffff', '#ffcf3f'];   // tank fish are seen from above, so their backs are pale
 
 // ===================== COMPONENTS =====================
 const _v = new THREE.Vector3();
@@ -597,7 +1088,7 @@ AFRAME.registerComponent('sim-runner', {
     if (m.preds.length !== P.preds) m.setPredators(P.preds);
     toStage(this.el.sceneEl.camera, this.cam);
     m.viewer.x = this.cam.x; m.viewer.y = this.cam.y; m.viewer.z = this.cam.z;
-    if (P.paused) return;
+    if (P.paused || SIM.mode !== 'ocean') return;     // the ocean pauses while you use the tank
     SIM.acc += s * P.speed;
     let k = 0;
     while (SIM.acc >= FIX.dt && k < 3) {
@@ -613,7 +1104,7 @@ AFRAME.registerComponent('sim-runner', {
 // Draws every fish and predator from the model, interpolated between model steps
 AFRAME.registerComponent('fish-school', {
   init: function () {
-    const fish = swimmingMesh(fishGeometry(0.24, '#24465c', '#dce8f0', '#7f9db0'), MAXN, 0.24, 16, 0.10);
+    const fish = swimmingMesh(fishGeometry(0.24, ...FISH_COLS), MAXN, 0.24, 16, 0.10, '#1a1a16');
     this.fish = fish.mesh; this.fishT = fish.uTime;
     this.fish.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAXN * 3), 3);
     this.fish.instanceColor.setUsage(THREE.DynamicDrawUsage);
@@ -623,14 +1114,16 @@ AFRAME.registerComponent('fish-school', {
       const b = 0.85 + 0.25 * rnd();
       this.base[i * 3] = b * (0.95 + 0.1 * rnd()); this.base[i * 3 + 1] = b; this.base[i * 3 + 2] = b * (1.0 + 0.08 * rnd());
     }
-    const pred = swimmingMesh(fishGeometry(0.9, '#2a333b', '#8c979f', '#3b4650'), 4, 0.9, 5, 0.12);
+    const pred = swimmingMesh(fishGeometry(0.9, ...PRED_COLS), 4, 0.9, 5, 0.12, '#3a1406');
     this.pred = pred.mesh; this.predT = pred.uTime;
     this.el.object3D.add(this.fish); this.el.object3D.add(this.pred);
   },
   tick: function (t) {
     const m = SIM.model; if (!m) return;
+    this.el.object3D.visible = SIM.mode === 'ocean';
+    if (SIM.mode !== 'ocean') return;
     const a = P.paused ? 1 : clamp(SIM.acc / FIX.dt, 0, 1);
-    this.clock = (this.clock || 0) + (P.paused || !this.lastT ? 0 : Math.min(t - this.lastT, 100) / 1000 * P.speed);
+    this.clock = (this.clock || 0) + (P.paused || SIM.mode !== 'ocean' || !this.lastT ? 0 : Math.min(t - this.lastT, 100) / 1000 * P.speed);
     this.lastT = t;
     this.fishT.value = this.predT.value = this.clock;
     const arr = this.fish.instanceMatrix.array, col = this.fish.instanceColor.array, base = this.base;
@@ -720,7 +1213,7 @@ AFRAME.registerComponent('seascape', {
 // Squeeze a controller's grip to become a threat: nearby fish flee from your hand
 AFRAME.registerComponent('hand-threat', {
   init: function () {
-    this.h = { x: 0, y: -10, z: 0, on: false };
+    this.h = { x: 0, y: -10, z: 0, on: false, el: this.el };
     this.mat = new THREE.MeshBasicMaterial({ color: '#9fd3ff', transparent: true, opacity: 0.5, fog: false });
     this.ball = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), this.mat);
     this.el.object3D.add(this.ball);
@@ -730,7 +1223,7 @@ AFRAME.registerComponent('hand-threat', {
   },
   tick: function () {
     const m = SIM.model; if (!m) return;
-    if (m.hands.indexOf(this.h) < 0) m.hands.push(this.h);
+    if (SIM.hands.indexOf(this.h) < 0) SIM.hands.push(this.h);
     toStage(this.el.object3D, this.tmp);
     this.h.x = this.tmp.x; this.h.y = this.tmp.y; this.h.z = this.tmp.z;
     this.mat.color.set(this.h.on ? COL.fear : '#9fd3ff'); this.mat.opacity = this.h.on ? 0.9 : 0.5;
@@ -744,10 +1237,6 @@ AFRAME.registerComponent('panel-toggle', {
     const flip = () => { SIM.panel = !SIM.panel; };
     document.querySelectorAll('[laser-controls]').forEach(c => { c.addEventListener('bbuttondown', flip); c.addEventListener('ybuttondown', flip); });
     window.addEventListener('keydown', (e) => { if (e.key === 'h' || e.key === 'H') flip(); });
-  },
-  tick: function () {
-    const p = document.querySelector('#panel').object3D;
-    p.visible = SIM.panel;
   }
 });
 
@@ -759,7 +1248,7 @@ AFRAME.registerComponent('info-display', {
     this.last = 0;
   },
   tick: function (t) {
-    if (!SIM.panel || t - this.last < 150) return;
+    if (!SIM.panel || SIM.mode !== 'ocean' || t - this.last < 150) return;
     this.last = t;
     this.draw();
   },
@@ -817,9 +1306,10 @@ AFRAME.registerComponent('info-display', {
     if (m.preds.length) {
       c.fillStyle = COL.fear; c.font = `600 30px ${FONT}`;
       c.fillText(`Fish caught: ${m.catches}   (${(m.catches / Math.max(m.t / 60, 1e-6)).toFixed(1)} per minute)`, 40, y); y += 44;
+      if (P.herdPreds && m.herdN) { c.fillStyle = COL.pred; c.font = `26px ${FONT}`; c.fillText(`Herded school: ${m.herdN} fish packed within a radius of ${m.herdR.toFixed(2)} m`, 40, y - 6); y += 36; }
     }
     c.fillStyle = '#b9c7da'; c.font = `26px ${FONT}`;
-    c.fillText('Squeeze a grip button: your hand scares the fish.', 40, y); y += 38;
+    c.fillText('Squeeze a grip button: your hand scares the fish. Predators are orange.', 40, y); y += 38;
     c.fillText('B or Y hides this panel. Walk into the school: fish avoid you.', 40, y); y += 38;
     c.fillStyle = COL.muted; c.font = `22px ${FONT}`;
     c.fillText(`${m.n} fish · model step ${SIM.stepMs.toFixed(1)} ms · ${SIM.fps.toFixed(0)} frames/s`, 40, H - 30);
@@ -827,14 +1317,46 @@ AFRAME.registerComponent('info-display', {
   }
 });
 
+
+// ===================== PANELS AND CONTROLS =====================
+// Each panel belongs to one view (mode-visible). Its controls respond only while that view is on and panels are shown.
+function panelActive(el) {
+  if (el._modeEl === undefined) el._modeEl = el.closest('[mode-visible]');
+  return SIM.panel && (!el._modeEl || el._modeEl.getAttribute('mode-visible').mode === SIM.mode);
+}
+function setClickable(el, on) {
+  if (el._clickable === on) return;
+  el._clickable = on;
+  if (on) el.classList.add('clickable'); else el.classList.remove('clickable');
+}
+AFRAME.registerComponent('mode-visible', {
+  schema: { mode: { type: 'string', default: 'ocean' } },
+  tick: function () { this.el.object3D.visible = SIM.panel && SIM.mode === this.data.mode; }
+});
+
+// While dragging with the mouse, stop the camera from rotating; call onUp when released
+function holdLook(cursorEl, onUp) {
+  const cam = document.querySelector('[camera]');
+  const mouse = cursorEl === cursorEl.sceneEl || cursorEl.tagName === 'A-SCENE';
+  if (mouse && cam) cam.setAttribute('look-controls', 'enabled', false);
+  const up = () => {
+    onUp();
+    if (mouse && cam) cam.setAttribute('look-controls', 'enabled', true);
+    cursorEl.removeEventListener('mouseup', up);
+  };
+  cursorEl.addEventListener('mouseup', up);
+}
+
 // ---------- Draggable slider (works with Quest controllers and a mouse) ----------
+// obj: which settings it changes (P = ocean, P2 = tank). scale: factor for the displayed value (e.g. units -> body lengths)
 AFRAME.registerComponent('ui-slider', {
-  schema: { key: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' },
-            step: { type: 'number', default: 1 }, decimals: { type: 'int', default: 0 },
+  schema: { key: { type: 'string' }, obj: { type: 'string', default: 'P' }, min: { type: 'number' }, max: { type: 'number' },
+            step: { type: 'number', default: 1 }, decimals: { type: 'int', default: 0 }, scale: { type: 'number', default: 1 },
             label: { type: 'string' }, unit: { type: 'string', default: '' },
             width: { type: 'number', default: 0.56 }, rule: { type: 'boolean', default: true } },
   init: function () {
     const d = this.data, w = d.width, o = new THREE.Group();
+    this.S = d.obj === 'P2' ? P2 : P;
     const basic = (col, opts) => new THREE.MeshBasicMaterial(Object.assign({ color: col, transparent: true, fog: false }, opts || {}));
     this.label = makeCanvasPlane(w, 640, 52);
     this.label.mesh.position.set(0, 0.028, 0.001); o.add(this.label.mesh);
@@ -852,7 +1374,7 @@ AFRAME.registerComponent('ui-slider', {
     this.el.addEventListener('mouseenter', () => { this.hover = true; });
     this.el.addEventListener('mouseleave', () => { this.hover = false; });
     this.el.addEventListener('mousedown', (e) => {
-      if (!SIM.panel) return;
+      if (!panelActive(this.el)) return;
       this.cursorEl = e.detail.cursorEl; this.dragging = true;
       this.setFromHit(e.detail.intersection);
       holdLook(this.cursorEl, () => { this.dragging = false; });
@@ -864,24 +1386,24 @@ AFRAME.registerComponent('ui-slider', {
     const frac = clamp((lp.x + d.width / 2) / d.width, 0, 1);
     let v = Math.round((d.min + frac * (d.max - d.min)) / d.step) * d.step;
     v = clamp(v, d.min, d.max);
-    if (v !== P[d.key]) {
-      P[d.key] = v;
-      if (d.rule) SIM.preset = 'custom';
+    if (v !== this.S[d.key]) {
+      this.S[d.key] = v;
+      if (d.rule) { if (this.S === P2) SIM2.preset = 'custom'; else SIM.preset = 'custom'; }
     }
   },
   tick: function () {
-    const d = this.data;
-    setClickable(this.el, SIM.panel);
-    if (!SIM.panel) { this.dragging = false; return; }
+    const d = this.data, on0 = panelActive(this.el);
+    setClickable(this.el, on0);
+    if (!on0) { this.dragging = false; return; }
     if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
       this.setFromHit(this.cursorEl.components.raycaster.getIntersection(this.el));
     }
-    const v = P[d.key], frac = clamp((v - d.min) / (d.max - d.min), 0, 1), on = this.hover || this.dragging;
+    const v = this.S[d.key], frac = clamp((v - d.min) / (d.max - d.min), 0, 1), on = this.hover || this.dragging;
     this.knob.position.x = -d.width / 2 + frac * d.width;
     this.fill.scale.x = Math.max(frac, 0.0001);
     this.knobMat.color.set(on ? '#ffd166' : '#eef3f8');
     this.knob.scale.setScalar(on ? 1.25 : 1);
-    const valTxt = `${v.toFixed(d.decimals)} ${d.unit}`.trim();
+    const valTxt = `${(v * d.scale).toFixed(d.decimals)} ${d.unit}`.trim();
     const txt = `${d.label}|${valTxt}`;
     if (txt !== this.drawn) {
       this.drawn = txt;
@@ -893,25 +1415,6 @@ AFRAME.registerComponent('ui-slider', {
     }
   }
 });
-
-function setClickable(el, on) {
-  if (el._clickable === on) return;
-  el._clickable = on;
-  if (on) el.classList.add('clickable'); else el.classList.remove('clickable');
-}
-
-// While dragging with the mouse, stop the camera from rotating; call onUp when released
-function holdLook(cursorEl, onUp) {
-  const cam = document.querySelector('[camera]');
-  const mouse = cursorEl === cursorEl.sceneEl || cursorEl.tagName === 'A-SCENE';
-  if (mouse && cam) cam.setAttribute('look-controls', 'enabled', false);
-  const up = () => {
-    onUp();
-    if (mouse && cam) cam.setAttribute('look-controls', 'enabled', true);
-    cursorEl.removeEventListener('mouseup', up);
-  };
-  cursorEl.addEventListener('mouseup', up);
-}
 
 // ---------- Grab handle: point at it and hold the trigger to move the panel ----------
 AFRAME.registerComponent('grab-move', {
@@ -928,7 +1431,7 @@ AFRAME.registerComponent('grab-move', {
     this.el.addEventListener('mouseenter', () => { this.hover = true; });
     this.el.addEventListener('mouseleave', () => { this.hover = false; });
     this.el.addEventListener('mousedown', (e) => {
-      const hit = e.detail.intersection; if (!hit || !SIM.panel) return;
+      const hit = e.detail.intersection; if (!hit || !panelActive(this.el)) return;
       this.cursorEl = e.detail.cursorEl; this.dragging = true;
       this.dist = hit.distance;
       const tg = this.data.target.object3D;
@@ -938,7 +1441,7 @@ AFRAME.registerComponent('grab-move', {
     });
   },
   tick: function () {
-    setClickable(this.el, SIM.panel);
+    setClickable(this.el, panelActive(this.el));
     if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
       const ray = this.cursorEl.components.raycaster.raycaster.ray;
       const tg = this.data.target.object3D, parent = tg.parent;
@@ -977,6 +1480,34 @@ AFRAME.registerComponent('auto-height', {
 });
 
 // ---------- Buttons ----------
+function setMode(mode) {
+  SIM.mode = mode;
+  if (mode !== 'ocean' && !SIM2.model) startModel2();
+}
+const BUTTONS = {
+  // ocean view
+  startle: ['Startle', () => {   // a sudden disturbance 2.5 m in front of you
+    const cam = document.querySelector('a-scene').camera, dir = new THREE.Vector3();
+    cam.getWorldDirection(dir); dir.y = 0; dir.normalize();
+    const p = toStage(cam, new THREE.Vector3()).add(dir.multiplyScalar(2.5));
+    SIM.model.scare(p.x, p.y, p.z);
+  }],
+  pause:   [() => P.paused ? '▶  Resume' : '❚❚  Pause', () => { P.paused = !P.paused; }, () => P.paused],
+  scatter: ['Scatter', () => { SIM.model.scatter(); SIM.acc = 0; }],
+  hide:    ['Hide panel', () => { SIM.panel = false; }],
+  toTank:  ['2D tank  ▶', () => setMode('tank')],
+  // tank view
+  pause2:  [() => P2.paused ? '▶  Resume' : '❚❚  Pause', () => { P2.paused = !P2.paused; }, () => P2.paused],
+  reset2:  ['Scatter', () => { SIM2.model.scatter(); }],
+  explain: ['Explain the rules', () => { setMode('tour'); tourGo(0, true); }],
+  toOcean: ['◀  3D ocean', () => setMode('ocean')],
+  // tour
+  prev:    ['◀  Back', () => tourGo(SIM2.tour.step - 1)],
+  next:    [() => SIM2.tour.step < STEPS.length - 1 ? 'Next  ▶' : 'Go to the tank  ✓', () => tourGo(SIM2.tour.step + 1)],
+  play:    [() => SIM2.tour.playing ? 'Playing…' : '▶  Play the group', () => { const t = SIM2.tour; if (!t.playing) { t.playing = true; t.playLeft = 240; } }],
+  regroup: ['↺  Reset group', () => { tourBuild(); }],
+  exit:    ['✕  Exit', () => { SIM2.tour.playing = false; setMode('tank'); }]
+};
 AFRAME.registerComponent('ui-button', {
   schema: { action: { type: 'string' }, width: { type: 'number', default: 0.18 } },
   init: function () {
@@ -988,37 +1519,35 @@ AFRAME.registerComponent('ui-button', {
     this.el.addEventListener('mouseenter', () => { this.hover = true; });
     this.el.addEventListener('mouseleave', () => { this.hover = false; });
     this.el.addEventListener('click', () => {
-      if (!SIM.panel) return;
-      const a = this.data.action, m = SIM.model;
-      if (PRESETS[a]) { applyPreset(a); if (a === 'mill') { m.scatter(); SIM.acc = 0; } return; }
-      switch (a) {
-        case 'pause': P.paused = !P.paused; break;
-        case 'startle': {   // a sudden disturbance 2.5 m in front of you
-          const cam = this.el.sceneEl.camera, dir = new THREE.Vector3();
-          cam.getWorldDirection(dir); dir.y = 0; dir.normalize();
-          const p = toStage(cam, new THREE.Vector3()).add(dir.multiplyScalar(2.5));
-          m.scare(p.x, p.y, p.z); break;
-        }
-        case 'scatter': m.scatter(); SIM.acc = 0; break;
-        case 'hide': SIM.panel = false; break;
-        case 'reset': applyPreset('school'); P.n = 500; P.speed = 1; P.paused = false; m.setCount(P.n); m.scatter();
-                      this.el.sceneEl.emit('reset-poses'); break;
+      if (!panelActive(this.el) || !this.shown()) return;
+      const a = this.data.action;
+      if (a.startsWith('p3:')) {             // ocean preset
+        const k = a.slice(3); applyPreset(k);
+        if (k === 'mill') { SIM.model.scatter(); SIM.acc = 0; }
+        return;
       }
+      if (a.startsWith('p2:')) { applyPreset2(a.slice(3)); return; }   // tank preset
+      BUTTONS[a][1]();
     });
+  },
+  shown: function () {
+    const a = this.data.action;
+    if (a === 'prev') return SIM2.tour.step > 0;
+    if (a === 'play' || a === 'regroup') return SIM2.tour.step === 7;
+    return true;
   },
   state: function () {
     const a = this.data.action;
-    if (PRESETS[a]) return [a === 'mill' ? 'Mill' : PRESETS[a].name, SIM.preset === a];
-    switch (a) {
-      case 'pause': return [P.paused ? '▶  Resume' : '❚❚  Pause', P.paused];
-      case 'startle': return ['Startle', false];
-      case 'scatter': return ['Scatter', false];
-      case 'hide': return ['Hide panel', false];
-      default: return ['↺  Reset', false];
-    }
+    if (a.startsWith('p3:')) { const k = a.slice(3); return [PRESETS[k].short || PRESETS[k].name, SIM.preset === k]; }
+    if (a.startsWith('p2:')) { const k = a.slice(3); return [PRESETS2[k].name, SIM2.preset === k]; }
+    const b = BUTTONS[a], label = typeof b[0] === 'function' ? b[0]() : b[0];
+    return [label, b[2] ? b[2]() : (a === 'next' || a === 'explain' || a === 'toTank' || a === 'toOcean')];
   },
   tick: function () {
-    setClickable(this.el, SIM.panel);
+    const vis = this.shown();
+    this.el.object3D.visible = vis;
+    setClickable(this.el, vis && panelActive(this.el));
+    if (!vis) return;
     const [label, active] = this.state();
     const key = label + active + this.hover;
     if (key === this.drawn) return;
@@ -1029,24 +1558,504 @@ AFRAME.registerComponent('ui-button', {
     roundRect(c, 4, 4, W - 8, 116, 22); c.fill();
     c.strokeStyle = this.hover ? '#ffd166' : 'rgba(143,163,191,0.4)'; c.lineWidth = 4;
     roundRect(c, 4, 4, W - 8, 116, 22); c.stroke();
-    c.fillStyle = COL.text; c.font = `600 34px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+    let size = 34; c.font = `600 ${size}px ${FONT}`;
+    while (c.measureText(label).width > W - 30 && size > 20) { size -= 2; c.font = `600 ${size}px ${FONT}`; }
+    c.fillStyle = COL.text; c.textAlign = 'center'; c.textBaseline = 'middle';
     c.fillText(label, W / 2, 64);
     this.c.tex.needsUpdate = true;
   }
 });
+
+// ===================== 2D TANK AND GUIDED TOUR =====================
+// The 2D model runs on a table top. Its edges wrap around (periodic boundaries), as in the 2D app.
+
+// ---------- Flat overlay shapes drawn on the table: rings, arrows and labels ----------
+function flatRingGeometry(r, w, dashed, fill) {
+  const pos = [], N = Math.max(24, Math.round(r * 400));
+  const r0 = fill ? 0 : r - w / 2, r1 = fill ? r : r + w / 2;
+  for (let k = 0; k < N; k++) {
+    if (dashed && k % 2) continue;
+    const a0 = k / N * Math.PI * 2, a1 = (k + 1) / N * Math.PI * 2;
+    const p = (rr, a) => [Math.cos(a) * rr, 0, Math.sin(a) * rr];
+    const A = p(r0, a0), B = p(r1, a0), C = p(r1, a1), D = p(r0, a1);
+    pos.push(...A, ...C, ...B, ...A, ...D, ...C);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  return g;
+}
+const _ringCache = new Map();
+function ringGeom(r, w, dashed, fill) {
+  const key = `${r.toFixed(3)}|${w}|${dashed}|${fill}`;
+  if (!_ringCache.has(key)) { if (_ringCache.size > 200) _ringCache.clear(); _ringCache.set(key, flatRingGeometry(r, w, dashed, fill)); }
+  return _ringCache.get(key);
+}
+const flatMat = (col, op) => new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: op === undefined ? 1 : op,
+                                                            depthWrite: false, fog: false, side: THREE.DoubleSide });
+
+function Overlay(group) {
+  this.g = group; this.rings = []; this.arrows = []; this.labels = []; this.nr = this.na = this.nl = 0;
+  const sh = new THREE.PlaneGeometry(1, 1); sh.rotateX(-Math.PI / 2); sh.translate(0.5, 0, 0);   // unit shaft along +x
+  this.shaftG = sh;
+  const hd = new THREE.BufferGeometry();
+  hd.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0, -1, 0, -0.5, -1, 0, 0.5], 3));  // head tip at origin
+  this.headG = hd;
+}
+Overlay.prototype.begin = function () { this.nr = this.na = this.nl = 0; };
+Overlay.prototype.end = function () {
+  for (let i = this.nr; i < this.rings.length; i++) this.rings[i].visible = false;
+  for (let i = this.na; i < this.arrows.length; i++) this.arrows[i].visible = false;
+  for (let i = this.nl; i < this.labels.length; i++) this.labels[i].mesh.visible = false;
+};
+// Ring (or filled disc) centred at (x, z)
+Overlay.prototype.ring = function (x, z, r, col, op, opts) {
+  opts = opts || {};
+  if (this.nr === this.rings.length) { const m = new THREE.Mesh(ringGeom(0.1, 0.004, false, false), flatMat('#fff')); m.renderOrder = 2; this.g.add(m); this.rings.push(m); }
+  const m = this.rings[this.nr++];
+  m.geometry = ringGeom(r, opts.w || 0.005, !!opts.dashed, !!opts.fill);
+  m.material.color.set(col); m.material.opacity = op;
+  m.position.set(x, opts.y || 0.006, z); m.visible = true;
+};
+// Arrow from (x, z) along (dx, dz), in metres. head: false for a plain line.
+Overlay.prototype.arrow = function (x, z, dx, dz, col, w, opts) {
+  opts = opts || {};
+  const len = Math.sqrt(dx * dx + dz * dz);
+  if (len < 1e-4) return;
+  if (this.na === this.arrows.length) {
+    const grp = new THREE.Group(), mat = flatMat('#fff');
+    const shaft = new THREE.Mesh(this.shaftG, mat), head = new THREE.Mesh(this.headG, mat);
+    shaft.renderOrder = head.renderOrder = 3;
+    grp.add(shaft); grp.add(head); grp.userData = { shaft, head, mat };
+    this.g.add(grp); this.arrows.push(grp);
+  }
+  const a = this.arrows[this.na++], u = a.userData, head = opts.head !== false;
+  const hl = head ? Math.min(len * 0.45, w * 3.2) : 0;
+  u.mat.color.set(col); u.mat.opacity = opts.op === undefined ? 1 : opts.op;
+  u.shaft.scale.set(Math.max(len - hl * 0.8, 1e-4), 1, w);
+  u.head.visible = head; u.head.position.set(len, 0, 0); u.head.scale.set(hl, 1, w * 2.6);
+  a.position.set(x, opts.y || 0.045, z);
+  a.rotation.set(0, -Math.atan2(dz, dx), 0);
+  a.visible = true;
+};
+// Text lying flat on the table, readable from the near side. align: 'left' | 'center' | 'right'
+Overlay.prototype.label = function (x, z, text, col, align, size) {
+  if (this.nl === this.labels.length) {
+    const c = makeCanvasPlane(0.48, 512, 64); c.mesh.rotation.x = -Math.PI / 2; c.mesh.renderOrder = 4;
+    this.g.add(c.mesh); c.drawn = ''; this.labels.push(c);
+  }
+  const c = this.labels[this.nl++], key = text + col;
+  if (c.drawn !== key) {
+    c.drawn = key;
+    const ctx = c.ctx; ctx.clearRect(0, 0, 512, 64);
+    ctx.font = `600 36px ${FONT}`; ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = 8;
+    ctx.fillStyle = col || COL.ink;
+    const w = ctx.measureText(text).width;
+    c.textW = w / 512 * 0.48;
+    ctx.textAlign = 'left'; ctx.fillText(text, 4, 34);
+    c.tex.needsUpdate = true;
+  }
+  const off = align === 'center' ? -c.textW / 2 : align === 'right' ? -c.textW : 0;
+  c.mesh.scale.setScalar(size || 1);
+  c.mesh.position.set(x + (off + 0.24) * (size || 1), 0.05, z);
+  c.mesh.visible = true;
+};
+
+// ---------- Guided tour: content and state (ported from the 2D app) ----------
+const TOUR_FISH = [
+  [0, 0, -70],
+  [6, 12, -40], [-36, 4, -30], [-26, 26, -20], [-30, -24, -35], [-10, 40, -25],
+  [70, -45, 100], [-82, -42, 10], [40, 76, 170]
+];
+const FORCE_LEN = 27;     // drawn length (world units) of a force of size 1
+const KV = 9;             // drawn length (world units) per unit of velocity (units/step)
+function tourBuild() {
+  const m = new Flat.Model(1000, 1000, P2), t = SIM2.tour;
+  TOUR_FISH.forEach(f => {
+    const a = f[2] * Math.PI / 180;
+    m.addFish(500 + f[0], 500 + f[1], Math.cos(a) * Flat.FIX.maxSpeed, Math.sin(a) * Flat.FIX.maxSpeed);
+  });
+  m.buildGrid();
+  t.model = m; t.cx = 500; t.cy = 500; t.playing = false; t.drag = -1;
+}
+function tourForces(i) {
+  const m = SIM2.tour.model, o = { list: [], sepList: [] };
+  m.buildGrid(); m.accel(i, o);
+  return o;
+}
+function tourStepInfo() {
+  const m = SIM2.tour.model, o = tourForces(0), vx = m.vx[0], vy = m.vy[0];
+  const a0 = Math.atan2(vy, vx), a1 = Math.atan2(vy + o.accY, vx + o.accX);
+  let da = (a1 - a0) * 180 / Math.PI; if (da > 180) da -= 360; if (da < -180) da += 360;
+  const push = Math.sqrt(o.pushX * o.pushX + o.pushY * o.pushY);
+  return { turn: Math.abs(da), capped: push > Flat.FIX.maxForce };
+}
+function tourGo(i, fresh) {
+  const t = SIM2.tour;
+  if (i < 0) return;
+  if (i >= STEPS.length) { t.playing = false; setMode('tank'); return; }
+  if (fresh || !t.model || (i < 7 && t.model.t > 0) || (i === 7 && t.step !== 7)) tourBuild();
+  if (t.step === 7 && i !== 7) t.playing = false;
+  t.step = i;
+}
+const fmt = v => (Math.round(v * 10) / 10).toString();
+const pct = v => Math.round(v * 100) + '%';
+const STEPS = [
+  { title: 'Meet the school',
+    text: () => '<p>Real fish schools have no leader. Each fish follows a few simple rules using only what it can sense nearby, and the school <b>emerges</b> from those rules.</p><p>We’ll follow one fish <b>(pink)</b> through a single time step of the model. The tank has been zoomed in around it.</p>' },
+  { title: 'What each fish senses',
+    text: o => '<p>Two distances matter.</p><p>The <b>perception radius</b> (dashed circle, ' + fmt(P2.R / BL2) + ' body lengths): fish inside it are <b>neighbours</b> (ringed), and they are the only fish it pays attention to. Here there ' + (o.n === 1 ? 'is <b>1 neighbour</b>' : 'are <b>' + o.n + ' neighbours</b>') + '.</p><p>The <b>personal space</b> (red circle, ' + fmt(Math.min(P2.Rsep, P2.R) / BL2) + ' body lengths): neighbours inside it are too close. Here there ' + (o.ns === 1 ? 'is <b>1</b>' : 'are <b>' + o.ns + '</b>') + '.</p>' },
+  { title: 'Rule 1: Separation',
+    text: o => o.ns > 0
+      ? '<p>Each neighbour inside personal space pushes the fish <b>directly away from it</b> (red arrow). The push is zero at the edge of personal space and grows as the neighbour gets closer' + (o.ns > 1 ? '; pushes from several neighbours add up' : '') + '.</p><p>Drag the intruding fish closer or further away and watch the arrow change.</p>'
+      : '<p>No neighbour is inside personal space, so there is <b>no separation push</b> this step. Drag a fish into the red circle to see one appear.</p>' },
+  { title: 'Rule 2: Alignment',
+    text: o => o.n > 0
+      ? '<p>The fish compares its own velocity (grey) with the <b>average velocity of its neighbours</b> (faint blue). The alignment push (blue arrow) is the <b>difference</b> between the two (thin line).</p><p>It is zero if the fish already swims like its neighbours, and larger the more out of step it is.</p>'
+      : '<p>No neighbours, so nothing to align with.</p>' },
+  { title: 'Rule 3: Cohesion',
+    text: o => o.n > 0
+      ? '<p>The fish is pulled <b>straight towards the centre of its neighbours</b> (green ⊕, green arrow).</p><p>The pull grows with distance: zero at the centre, and strongest when the centre is a full perception radius away. Here it is ' + pct(Math.sqrt(o.cohX * o.cohX + o.cohY * o.cohY)) + ' of that maximum.</p>'
+      : '<p>No neighbours, so no pull towards a group.</p>' },
+  { title: 'The overall push',
+    text: () => '<p>At each step the fish is pushed by these three forces. Each is multiplied by a <b>weight</b>, and adding them tip to tail gives the <b>overall push</b> (white):</p><p><b>' + fmt(P2.sep) + '</b> × separation + <b>' + fmt(P2.ali) + '</b> × alignment + <b>' + fmt(P2.coh) + '</b> × cohesion</p><p>The <b>sizes</b> of the forces come from where the neighbours are, and change every step. The <b>weights</b> (the sliders below) are fixed traits shared by all fish: how much they care about each rule. Changing the weights is how you get different kinds of collective behaviour. Try it now.</p>' },
+  { title: 'Turning, gradually',
+    text: (o, extra) => '<p>The overall push changes the fish’s velocity. The change per step is capped' + (extra.capped ? ' (the cap is active right now)' : '') + ', which acts like inertia, and the fish also drifts back towards its cruising speed.</p><p>So in one step its heading changes by only <b>' + extra.turn.toFixed(1) + '°</b>. The change is drawn 10× larger than reality so you can see it. This is why schools turn smoothly.</p>' },
+  { title: 'Everyone at once',
+    text: () => '<p>Every fish does the same calculation from the <b>same snapshot</b>, then they all move together. The arrows show each fish’s overall push. (If fish moved one at a time, later fish would react to where others had already gone.)</p><p>Press <b>Play the group</b> to run this small group for a few seconds.</p>' },
+  { title: 'Now scale it up',
+    text: () => '<p>The tank applies exactly these rules to about a hundred fish. Its edges wrap around: a fish leaving one side comes back on the other, so there are no walls to complicate things.</p><p>Watch the <b>polarisation</b> plot: it measures how aligned the school is, from 0 (random headings) to 1 (everyone swimming the same way). Then try the presets, or go back to the 3D ocean to see the same rules all around you.</p>' }
+];
+const DRAG_STEPS = { 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1 };
+
+// Tour zoom (metres per world unit): the perception circle fills most of the table's depth
+function tourScale() { return TANK.d * 0.95 / (P2.R * 2 * 1.35); }
+
+// ---------- The tank: table, fish, overlays, stepping ----------
+AFRAME.registerComponent('tank-view', {
+  init: function () {
+    const o = this.el.object3D;
+    // table and water
+    const table = new THREE.Mesh(new THREE.BoxGeometry(TANK.w + 0.12, 0.78, TANK.d + 0.12), new THREE.MeshLambertMaterial({ color: '#1d2b36' }));
+    table.position.y = -0.4; o.add(table);
+    const wc = document.createElement('canvas'); wc.width = 8; wc.height = 256;
+    const wx = wc.getContext('2d'), gr = wx.createLinearGradient(0, 0, 0, 256);
+    gr.addColorStop(0, '#16506e'); gr.addColorStop(1, '#0a2433'); wx.fillStyle = gr; wx.fillRect(0, 0, 8, 256);
+    const wtex = new THREE.CanvasTexture(wc); wtex.colorSpace = THREE.SRGBColorSpace;
+    const water = new THREE.Mesh(new THREE.PlaneGeometry(TANK.w, TANK.d), new THREE.MeshBasicMaterial({ map: wtex, fog: false }));
+    water.rotation.x = -Math.PI / 2; water.position.y = 0.002; o.add(water);
+    const rimMat = new THREE.MeshBasicMaterial({ color: '#2f7fb8', fog: false });
+    [[TANK.w + 0.12, 0, TANK.d / 2 + 0.03, 0.06], [TANK.w + 0.12, 0, -TANK.d / 2 - 0.03, 0.06]].forEach(r => {
+      const b = new THREE.Mesh(new THREE.BoxGeometry(r[0], 0.03, r[3]), rimMat); b.position.set(r[1], 0.0, r[2]); o.add(b); });
+    [[TANK.w / 2 + 0.03], [-TANK.w / 2 - 0.03]].forEach(r => {
+      const b = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.03, TANK.d), rimMat); b.position.set(r[0], 0.0, 0); o.add(b); });
+    // fish and predators (geometry of unit length, scaled per instance)
+    const fish = swimmingMesh(fishGeometry(1, ...FISH2_COLS), 512, 1, 14, 0.10, '#202020');
+    this.fish = fish.mesh; this.fishT = fish.uTime;
+    this.fish.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(512 * 3).fill(1), 3);
+    this.fish.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    const pred = swimmingMesh(fishGeometry(1, ...PRED_COLS), 4, 1, 6, 0.12, '#3a1406');
+    this.pred = pred.mesh; this.predT = pred.uTime;
+    o.add(this.fish); o.add(this.pred);
+    this.ov = new Overlay(o);
+    this.clock = 0; this.scareT = 0;
+    this.tmp = new THREE.Vector3();
+  },
+  tick: function (t, dt) {
+    const show = SIM.mode === 'tank' || SIM.mode === 'tour';
+    this.el.object3D.visible = show;
+    if (!show || !dt) return;
+    const s = Math.min(dt, 100) / 1000;
+    if (SIM.mode === 'tank') this.runTank(s); else this.runTour(s);
+  },
+
+  // ----- free-running 2D simulation -----
+  runTank: function (s) {
+    const m = SIM2.model;
+    if (m.n !== P2.n) m.setCount(P2.n);
+    if (m.preds.length !== P2.preds) m.setPredators(P2.preds);
+    this.handScare(m);
+    if (!P2.paused) {
+      SIM2.acc += s * 60 * P2.speed;
+      let k = 0;
+      while (SIM2.acc >= 1 && k < 6) {
+        SIM2.px.set(m.x.subarray(0, m.n)); SIM2.py.set(m.y.subarray(0, m.n));
+        m.step(); SIM2.acc -= 1; k++;
+      }
+      if (k === 6) SIM2.acc = 0;
+      this.clock += s * P2.speed;
+    }
+    const a = P2.paused ? 1 : clamp(SIM2.acc, 0, 1);
+    const k = TANK.w / TANK.W, cx = TANK.W / 2, cy = TANK.H / 2, sc = BL2 * k * 1.6;
+    const arr = this.fish.instanceMatrix.array, col = this.fish.instanceColor.array;
+    for (let i = 0; i < m.n; i++) {
+      let x = m.x[i], y = m.y[i];
+      const qx = SIM2.px[i], qy = SIM2.py[i];
+      if (Math.abs(x - qx) < TANK.W / 2 && Math.abs(y - qy) < TANK.H / 2) { x = qx + (x - qx) * a; y = qy + (y - qy) * a; }
+      writePose(arr, i, (x - cx) * k, 0.03, (y - cy) * k, m.vx[i], 0, m.vy[i], sc);
+      const f = m.fear[i], b = 1 + 0.6 * f;
+      col[i * 3] = col[i * 3 + 1] = col[i * 3 + 2] = b;
+    }
+    this.fish.count = m.n;
+    this.fish.instanceMatrix.needsUpdate = true; this.fish.instanceColor.needsUpdate = true;
+    const pa = this.pred.instanceMatrix.array;
+    m.preds.forEach((p, j) => writePose(pa, j, (p.x - cx) * k, 0.05, (p.y - cy) * k, p.vx, 0, p.vy, sc * 2.4));
+    this.pred.count = m.preds.length; this.pred.instanceMatrix.needsUpdate = true;
+    this.fishT.value = this.predT.value = this.clock;
+    // startle ripples
+    this.ov.begin();
+    for (const sc2 of m.scares) {
+      const life = sc2.life / Flat.FIX.scareLife;
+      this.ov.ring((sc2.x - cx) * k, (sc2.y - cy) * k, (1 - life) * Flat.FIX.fearR * k, '#ffffff', 0.6 * life, { w: 0.006 });
+    }
+    this.ov.end();
+  },
+  // A gripping hand held over the tank startles the fish beneath it
+  handScare: function (m) {
+    if (++this.scareT % 12) return;
+    const k = TANK.w / TANK.W;
+    for (const h of SIM.hands) {
+      if (!h.on || !h.el) continue;
+      h.el.object3D.getWorldPosition(this.tmp); this.el.object3D.worldToLocal(this.tmp);
+      if (Math.abs(this.tmp.x) < TANK.w / 2 && Math.abs(this.tmp.z) < TANK.d / 2 && this.tmp.y < 0.5 && this.tmp.y > -0.1)
+        m.scare(this.tmp.x / k + TANK.W / 2, this.tmp.z / k + TANK.H / 2);
+    }
+  },
+
+  // ----- guided tour: a small zoomed-in group around one pink fish -----
+  runTour: function (s) {
+    const tr = SIM2.tour, m = tr.model;
+    if (!m) return;
+    if (tr.playing) {
+      tr.acc = (tr.acc || 0) + s * 60;
+      while (tr.acc >= 1) {
+        m.step(); tr.acc -= 1;
+        tr.cx += (m.x[0] - tr.cx) * 0.08; tr.cy += (m.y[0] - tr.cy) * 0.08;
+        if (--tr.playLeft <= 0) { tr.playing = false; tr.acc = 0; break; }
+      }
+      this.clock += s;
+    }
+    const k = tourScale(), step = tr.step, ov = this.ov;
+    const T = (x, y) => [(x - tr.cx) * k, (y - tr.cy) * k];
+    const inside = (X, Z) => Math.abs(X) < TANK.w / 2 - 0.03 && Math.abs(Z) < TANK.d / 2 - 0.03;
+    const o = tourForces(0), nb = {};
+    o.list.forEach(j => { nb[j] = 1; });
+    const sc = BL2 * k * 1.25, arr = this.fish.instanceMatrix.array, col = this.fish.instanceColor.array;
+    for (let i = 0; i < m.n; i++) {
+      const [X, Z] = T(m.x[i], m.y[i]);
+      if (!inside(X, Z)) { hidePose(arr, i); continue; }
+      writePose(arr, i, X, 0.035, Z, m.vx[i], 0, m.vy[i], sc * (i === 0 ? 1.15 : 1));
+      const dim = step >= 1 && step <= 6 && !nb[i] && !tr.playing && i !== 0;
+      if (i === 0) { col[0] = 2.2; col[1] = 0.9; col[2] = 1.7; }
+      else { const b = dim ? 0.3 : 1; col[i * 3] = col[i * 3 + 1] = col[i * 3 + 2] = b; }
+    }
+    this.fish.count = m.n;
+    this.fish.instanceMatrix.needsUpdate = true; this.fish.instanceColor.needsUpdate = true;
+    this.pred.count = 0;
+    this.fishT.value = this.clock;
+
+    ov.begin();
+    const [fx, fz] = T(m.x[0], m.y[0]), Rs = Math.min(P2.Rsep, P2.R);
+    ov.ring(fx, fz, sc * 0.62, COL.focal, 0.9, { w: 0.006, y: 0.006 });
+    if (!tr.playing) {
+      if (step >= 1 && step <= 5) {
+        ov.ring(fx, fz, P2.R * k, COL.ink, 0.7, { dashed: true, w: 0.006 });
+        ov.ring(fx, fz, P2.R * k, COL.ink, 0.05, { fill: true, y: 0.003 });
+        ov.ring(fx, fz, Rs * k, COL.sep, 0.9, { w: 0.006 });
+        ov.ring(fx, fz, Rs * k, COL.sep, 0.08, { fill: true, y: 0.0035 });
+        o.list.forEach(j => { const [X, Z] = T(m.x[j], m.y[j]); ov.ring(X, Z, sc * 0.75, COL.ink, 0.6, { w: 0.004 }); });
+        if (step === 1) {
+          ov.label(fx, fz - P2.R * k - 0.035, 'perception radius', COL.ink, 'center');
+          ov.label(fx, fz - Rs * k - 0.03, 'personal space', COL.sep, 'center');
+        }
+      }
+      const W3 = 0.011, W1 = 0.005;
+      const tip = (x, z, dx, dz, text, c, side) => {
+        const L = Math.sqrt(dx * dx + dz * dz) || 1, px = -dz / L, pz = dx / L, sd = side || 0;
+        ov.label(x + dx + dx / L * 0.03 + px * sd * 0.035, z + dz + dz / L * 0.03 + pz * sd * 0.035 + 0.01, text, c, dx >= 0 ? 'left' : 'right', 0.85);
+      };
+      const F = FORCE_LEN * k, V = KV * k;
+      const sepV = [o.sepX * F, o.sepY * F], aliV = [o.aliX * F, o.aliY * F], cohV = [o.cohX * F, o.cohY * F];
+      if (step === 2) {
+        o.sepList.forEach(j => { const [X, Z] = T(m.x[j], m.y[j]); ov.arrow(fx, fz, X - fx, Z - fz, COL.sep, W1 * 0.8, { head: false, op: 0.6 }); });
+        ov.arrow(fx, fz, sepV[0], sepV[1], COL.sep, W3);
+        if (o.ns) tip(fx, fz, sepV[0], sepV[1], 'separation', COL.sep);
+      }
+      if (step === 3 && o.n) {
+        o.list.forEach(j => { const [X, Z] = T(m.x[j], m.y[j]); ov.arrow(X, Z, m.vx[j] * V * 0.6, m.vy[j] * V * 0.6, COL.ink, W1, { op: 0.45 }); });
+        const v0 = [m.vx[0] * V, m.vy[0] * V], av = [o.avx * V, o.avy * V];
+        ov.arrow(fx, fz, v0[0], v0[1], '#b8c4cc', W1 * 1.4);
+        ov.arrow(fx, fz, av[0], av[1], COL.ali, W1 * 1.4, { op: 0.55 });
+        ov.arrow(fx + v0[0], fz + v0[1], av[0] - v0[0], av[1] - v0[1], COL.ali, W1 * 0.7, { head: false, op: 0.8 });
+        ov.arrow(fx, fz, aliV[0], aliV[1], COL.ali, W3);
+        tip(fx, fz, aliV[0], aliV[1], 'alignment', COL.ali);
+        const crs = v0[0] * av[1] - v0[1] * av[0], sd = crs >= 0 ? 1 : -1;
+        tip(fx, fz, v0[0], v0[1], 'own velocity', '#b8c4cc', -sd);
+        tip(fx, fz, av[0], av[1], 'neighbours’ average', COL.ali, sd);
+      }
+      if (step === 4 && o.n) {
+        const cp = [fx + o.cx * k, fz + o.cy * k];
+        ov.arrow(fx, fz, cp[0] - fx, cp[1] - fz, COL.coh, W1 * 0.8, { head: false, op: 0.7 });
+        ov.ring(cp[0], cp[1], 0.018, COL.coh, 1, { w: 0.005, y: 0.045 });
+        ov.arrow(cp[0] - 0.018, cp[1], 0.036, 0, COL.coh, 0.004, { head: false });
+        ov.arrow(cp[0], cp[1] - 0.018, 0, 0.036, COL.coh, 0.004, { head: false });
+        const offL = Math.sqrt(o.cx * o.cx + o.cy * o.cy) || 1;
+        ov.label(cp[0] + o.cx / offL * 0.04, cp[1] + o.cy / offL * 0.04 + 0.01, 'centre of neighbours', COL.coh, o.cx >= 0 ? 'left' : 'right', 0.85);
+        ov.arrow(fx, fz, cohV[0], cohV[1], COL.coh, W3);
+        tip(fx, fz, cohV[0], cohV[1], 'cohesion', COL.coh, cohV[0] >= 0 ? -1 : 1);
+      }
+      if (step === 5) {
+        const a1 = [sepV[0] * P2.sep, sepV[1] * P2.sep], a2 = [aliV[0] * P2.ali, aliV[1] * P2.ali], a3 = [cohV[0] * P2.coh, cohV[1] * P2.coh];
+        const tx = a1[0] + a2[0] + a3[0], tz = a1[1] + a2[1] + a3[1];
+        ov.arrow(fx, fz, tx, tz, '#ffffff', W3 * 1.1, { op: 0.9, y: 0.042 });
+        ov.arrow(fx, fz, a1[0], a1[1], COL.sep, W3 * 0.8, { y: 0.048 });
+        ov.arrow(fx + a1[0], fz + a1[1], a2[0], a2[1], COL.ali, W3 * 0.8, { y: 0.048 });
+        ov.arrow(fx + a1[0] + a2[0], fz + a1[1] + a2[1], a3[0], a3[1], COL.coh, W3 * 0.8, { y: 0.048 });
+        tip(fx, fz, tx, tz, 'overall push', '#ffffff');
+      }
+      if (step === 6) {
+        const vx = m.vx[0], vy = m.vy[0], nvx = vx + o.accX, nvy = vy + o.accY, V6 = V * 1.6;
+        const side = vx * o.accY - vy * o.accX >= 0 ? 1 : -1;
+        ov.arrow(fx, fz, vx * V6, vy * V6, '#b8c4cc', W1 * 1.6);
+        tip(fx, fz, vx * V6, vy * V6, 'current velocity', '#b8c4cc', -side);
+        ov.arrow(fx, fz, nvx * V6, nvy * V6, COL.focal, W1 * 1.6, { op: 0.7 });
+        ov.arrow(fx + vx * V6, fz + vy * V6, o.accX * V6 * 10, o.accY * V6 * 10, '#ffffff', W3);
+        tip(fx + vx * V6, fz + vy * V6, o.accX * V6 * 10, o.accY * V6 * 10, 'change ×10', '#ffffff');
+        tip(fx, fz, vx * V6 * 0.6, vy * V6 * 0.6, 'new velocity (faint pink)', COL.focal, side);
+      }
+      if (step === 7) {
+        const oo = { list: null, sepList: null };
+        for (let i = 0; i < m.n; i++) {
+          m.accel(i, oo);
+          const [X, Z] = T(m.x[i], m.y[i]);
+          if (!inside(X, Z)) continue;
+          const gx = (P2.sep * oo.sepX + P2.ali * oo.aliX + P2.coh * oo.cohX) * F * 0.6;
+          const gz = (P2.sep * oo.sepY + P2.ali * oo.aliY + P2.coh * oo.cohY) * F * 0.6;
+          ov.arrow(X, Z, gx, gz, '#ffffff', W1 * 1.6);
+        }
+      }
+    }
+    ov.end();
+  },
+  // tank coordinates (metres, local) -> model world units, for the view currently shown
+  toWorld: function (X, Z) {
+    if (SIM.mode === 'tank') { const k = TANK.w / TANK.W; return [X / k + TANK.W / 2, Z / k + TANK.H / 2]; }
+    const tr = SIM2.tour, k = tourScale();
+    return [X / k + tr.cx, Z / k + tr.cy];
+  }
+});
+
+// Invisible surface over the tank that the controller rays hit: click to startle (tank), drag fish (tour)
+AFRAME.registerComponent('tank-hit', {
+  init: function () {
+    const g = new THREE.PlaneGeometry(TANK.w, TANK.d); g.rotateX(-Math.PI / 2);
+    this.el.setObject3D('mesh', new THREE.Mesh(g, new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false })));
+    this.view = () => this.el.parentNode.components['tank-view'];
+    this.el.addEventListener('mousedown', (e) => {
+      const hit = e.detail.intersection; if (!hit) return;
+      const lp = this.el.object3D.worldToLocal(hit.point.clone()), w = this.view().toWorld(lp.x, lp.z);
+      if (SIM.mode === 'tank') { SIM2.model.scare(w[0], w[1]); return; }
+      const tr = SIM2.tour;
+      if (SIM.mode !== 'tour' || !DRAG_STEPS[tr.step] || tr.playing) return;
+      let best = -1, bd = (BL2 * 2.5) ** 2;
+      for (let i = 0; i < tr.model.n; i++) { const d2 = (tr.model.x[i] - w[0]) ** 2 + (tr.model.y[i] - w[1]) ** 2; if (d2 < bd) { bd = d2; best = i; } }
+      if (best < 0) return;
+      tr.drag = best; this.cursorEl = e.detail.cursorEl;
+      holdLook(this.cursorEl, () => { tr.drag = -1; });
+    });
+  },
+  tick: function () {
+    setClickable(this.el, SIM.mode === 'tank' || SIM.mode === 'tour');
+    const tr = SIM2.tour;
+    if (SIM.mode !== 'tour' || tr.drag < 0 || !this.cursorEl || !this.cursorEl.components.raycaster) return;
+    const hit = this.cursorEl.components.raycaster.getIntersection(this.el); if (!hit) return;
+    const lp = this.el.object3D.worldToLocal(hit.point.clone()), w = this.view().toWorld(lp.x, lp.z);
+    tr.model.x[tr.drag] = w[0]; tr.model.y[tr.drag] = w[1];
+  }
+});
+
+// ---------- Readout for the tank: preset, polarisation and its history ----------
+AFRAME.registerComponent('tank-info', {
+  init: function () { this.c = makeCanvasPlane(0.72, 1024, 1200); this.el.object3D.add(this.c.mesh); this.last = 0; },
+  tick: function (t) {
+    if (!SIM.panel || SIM.mode !== 'tank' || t - this.last < 150) return;
+    this.last = t;
+    const c = this.c.ctx, m = SIM2.model, W = 1024, H = 1200;
+    c.clearRect(0, 0, W, H);
+    c.fillStyle = COL.panel; roundRect(c, 0, 0, W, H, 28); c.fill();
+    c.textBaseline = 'alphabetic'; c.textAlign = 'left';
+    c.fillStyle = COL.muted; c.font = `700 28px ${FONT}`; c.fillText('FISH SCHOOL · 2D TANK', 40, 58);
+    const pr = PRESETS2[SIM2.preset];
+    c.fillStyle = COL.text; c.font = `700 44px ${FONT}`; c.fillText(pr ? pr.name : 'Custom settings', 40, 118);
+    c.fillStyle = '#b9c7da'; c.font = `27px ${FONT}`;
+    wrapLines(c, pr ? pr.text : 'You have changed the rules. Watch how the school responds, then try a preset to compare.', 944).slice(0, 3)
+      .forEach((ln, k) => c.fillText(ln, 40, 164 + k * 36));
+    c.fillStyle = COL.muted; c.font = `28px ${FONT}`; c.fillText('Polarisation  (0 = random headings, 1 = all aligned)', 40, 312);
+    c.fillStyle = COL.P; c.font = `700 96px ${FONT}`; c.fillText(m.polar.toFixed(2), 40, 410);
+    // history (last 900 steps, 15 s)
+    const px0 = 70, px1 = 984, py0 = 470, py1 = 720;
+    c.strokeStyle = 'rgba(143,163,191,0.25)'; c.lineWidth = 1; c.textAlign = 'right'; c.font = `20px ${FONT}`;
+    for (const v of [0, 0.5, 1]) { const y = py1 - v * (py1 - py0); c.beginPath(); c.moveTo(px0, y); c.lineTo(px1, y); c.stroke(); c.fillStyle = COL.muted; c.fillText(v.toFixed(1), px0 - 10, y + 7); }
+    c.textAlign = 'left'; c.fillStyle = COL.muted; c.fillText('last 900 steps (15 s)', px0, py1 + 34);
+    const N = m.hist.length, L = m.histLen;
+    c.strokeStyle = COL.P; c.lineWidth = 4; c.beginPath();
+    for (let j = 0; j < L; j++) {
+      const v = m.hist[(m.histPos - L + j + N) % N], x = px0 + (px1 - px0) * (j + N - L) / (N - 1), y = py1 - v * (py1 - py0);
+      if (j) c.lineTo(x, y); else c.moveTo(x, y);
+    }
+    c.stroke();
+    let y = 820;
+    if (m.preds.length) { c.fillStyle = COL.pred; c.font = `600 30px ${FONT}`; c.fillText(`Fish caught: ${m.catches}`, 40, y); y += 50; }
+    c.fillStyle = '#b9c7da'; c.font = `26px ${FONT}`;
+    ['Point at the tank and pull the trigger to startle the fish,', 'or squeeze a grip with your hand over the water.',
+     'The edges wrap around: there are no walls.', 'Explain the rules opens a step-by-step tour.'].forEach(s => { c.fillText(s, 40, y); y += 38; });
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Tour text ----------
+AFRAME.registerComponent('explain-display', {
+  init: function () { this.c = makeCanvasPlane(1.24, 1024, 600); this.el.object3D.add(this.c.mesh); this.last = 0; },
+  tick: function (t) {
+    if (!SIM.panel || SIM.mode !== 'tour' || t - this.last < 120) return;
+    this.last = t;
+    const tr = SIM2.tour, st = STEPS[tr.step], c = this.c.ctx, W = 1024, H = 600;
+    c.clearRect(0, 0, W, H);
+    c.fillStyle = COL.panel; roundRect(c, 0, 0, W, H, 28); c.fill();
+    c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+    for (let i = 0; i < STEPS.length; i++) {
+      c.fillStyle = i === tr.step ? '#ffd166' : i < tr.step ? '#4aa3df' : '#2b3a4f';
+      c.beginPath(); c.arc(44 + i * 30, 44, 9, 0, 2 * Math.PI); c.fill();
+    }
+    c.fillStyle = COL.muted; c.font = `600 24px ${FONT}`;
+    c.fillText(`STEP ${tr.step + 1} OF ${STEPS.length}`, 44 + STEPS.length * 30 + 16, 53);
+    c.fillStyle = COL.text; c.font = `700 48px ${FONT}`; c.fillText(st.title, 40, 120);
+    const y = drawRich(c, st.text(tourForces(0), tourStepInfo()), 40, 172, 944, 29, 39, '#d5deea', '#ffffff');
+    if (DRAG_STEPS[tr.step]) {
+      c.fillStyle = COL.muted; c.font = `italic 25px ${FONT}`;
+      c.fillText('Tip: point at any fish and hold the trigger to drag it. Everything updates at once.', 40, Math.min(H - 24, Math.max(y, 520)));
+    }
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+
     </script>
   </head>
   <body>
     <!--
-      FISH SCHOOL IN 3D (VR)
-      An agent-based school of fish all around you. Each fish follows three local rules
-      (separation, alignment, cohesion), as in the 2D flocking app, now in three dimensions.
-      Desktop: drag to look around, WASD to move, click and drag sliders, H hides the panel.
-      Quest: open in the browser, press the VR button. Point with either controller and pull the
-      trigger to use the panel; squeeze a grip button to scare fish with your hand; B or Y hides the panel.
+      FISH SCHOOL (VR)
+      Agent-based fish schooling, with the same three local rules (separation, alignment, cohesion) as the
+      2D flocking app. Three views:
+        3D ocean  - the school swims all around you (default)
+        2D tank   - the original 2D model on a table, edges wrapping around
+        Tour      - a step-by-step explainer of the rules, in the tank
+      Desktop: drag to look around, WASD to move, click buttons and drag sliders, H hides the panel.
+      Quest: open in the browser and press the VR button. Point with either controller and pull the trigger to
+      use the panel; squeeze a grip button to scare fish with your hand; B or Y hides the panel.
     -->
     <a-scene background="color: #0b3c5a"
-             fog="type: exponential; color: #0b3c5a; density: 0.14"
+             fog="type: exponential; color: #0b3c5a; density: 0.105"
              light="defaultLightsEnabled: false"
              renderer="antialias: true; colorManagement: true; foveationLevel: 1"
              cursor="rayOrigin: mouse; fuse: false"
@@ -1062,18 +2071,21 @@ AFRAME.registerComponent('ui-button', {
         <a-entity seascape></a-entity>
         <a-entity fish-school></a-entity>
 
+        <!-- The 2D tank on its table (shown in the tank and tour views) -->
+        <a-entity tank-view position="0 0.82 -1.2">
+          <a-entity tank-hit position="0 0.07 0"></a-entity>
+        </a-entity>
+
         <!-- A small platform under your feet, which helps with comfort in VR -->
         <a-ring radius-inner="0.48" radius-outer="0.52" rotation="-90 0 0" position="0 0.01 0"
                 material="shader: flat; color: #2f7fb8; opacity: 0.6; transparent: true"></a-ring>
 
-        <!-- Control panel -->
-        <a-entity id="panel" position="0.55 1.0 -1.05" rotation="-30 -28 0">
+        <!-- 3D ocean panel -->
+        <a-entity id="panel" mode-visible="mode: ocean" position="0.55 1.02 -1.05" rotation="-30 -28 0">
           <a-entity grab-move="target: #panel; label: Grab here to move panel; width: 0.6" position="0 0.52 0.002"></a-entity>
-          <a-plane width="1.46" height="0.98" position="0 0 -0.004" material="shader: flat; color: #2a3b55; fog: false"></a-plane>
-          <a-plane width="1.44" height="0.96" position="0 0 -0.002" material="shader: flat; color: #0b1320; fog: false"></a-plane>
-
-          <a-entity info-display position="-0.355 0 0.001"></a-entity>
-
+          <a-plane width="1.46" height="1.055" position="0 -0.047 -0.004" material="shader: flat; color: #2a3b55; fog: false"></a-plane>
+          <a-plane width="1.44" height="1.035" position="0 -0.047 -0.002" material="shader: flat; color: #0b1320; fog: false"></a-plane>
+          <a-entity info-display position="-0.355 -0.047 0.001"></a-entity>
           <a-entity ui-slider="key: sep; min: 0; max: 3; step: 0.1; decimals: 1; label: Separation" position="0.36 0.420 0.002"></a-entity>
           <a-entity ui-slider="key: ali; min: 0; max: 3; step: 0.1; decimals: 1; label: Alignment" position="0.36 0.345 0.002"></a-entity>
           <a-entity ui-slider="key: coh; min: 0; max: 3; step: 0.1; decimals: 1; label: Cohesion" position="0.36 0.270 0.002"></a-entity>
@@ -1081,18 +2093,63 @@ AFRAME.registerComponent('ui-button', {
           <a-entity ui-slider="key: blind; min: 0; max: 180; step: 10; label: Blind angle behind; unit: °" position="0.36 0.120 0.002"></a-entity>
           <a-entity ui-slider="key: turnDeg; min: 20; max: 150; step: 5; label: Fastest turn; unit: °/s" position="0.36 0.045 0.002"></a-entity>
           <a-entity ui-slider="key: n; min: 50; max: 1000; step: 50; label: Number of fish; rule: false" position="0.36 -0.030 0.002"></a-entity>
-          <a-entity ui-slider="key: preds; min: 0; max: 3; step: 1; label: Predators; rule: false" position="0.36 -0.105 0.002"></a-entity>
+          <a-entity ui-slider="key: preds; min: 0; max: 4; step: 1; label: Predators; rule: false" position="0.36 -0.105 0.002"></a-entity>
           <a-entity ui-slider="key: speed; min: 0.25; max: 2; step: 0.25; decimals: 2; label: Simulation speed; unit: ×; rule: false" position="0.36 -0.180 0.002"></a-entity>
+          <a-entity ui-button="action: p3:school; width: 0.18" position="0.170 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: p3:noali; width: 0.18" position="0.360 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: p3:loners; width: 0.18" position="0.550 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: p3:mill; width: 0.18" position="0.170 -0.350 0.002"></a-entity>
+          <a-entity ui-button="action: p3:attack; width: 0.18" position="0.360 -0.350 0.002"></a-entity>
+          <a-entity ui-button="action: p3:bait; width: 0.18" position="0.550 -0.350 0.002"></a-entity>
+          <a-entity ui-button="action: startle; width: 0.18" position="0.170 -0.435 0.002"></a-entity>
+          <a-entity ui-button="action: pause; width: 0.18" position="0.360 -0.435 0.002"></a-entity>
+          <a-entity ui-button="action: scatter; width: 0.18" position="0.550 -0.435 0.002"></a-entity>
+          <a-entity ui-button="action: toTank; width: 0.18" position="0.170 -0.520 0.002"></a-entity>
+          <a-entity ui-button="action: explain; width: 0.18" position="0.360 -0.520 0.002"></a-entity>
+          <a-entity ui-button="action: hide; width: 0.18" position="0.550 -0.520 0.002"></a-entity>
+        </a-entity>
 
-          <a-entity ui-button="action: school" position="0.17 -0.265 0.002"></a-entity>
-          <a-entity ui-button="action: noali" position="0.36 -0.265 0.002"></a-entity>
-          <a-entity ui-button="action: loners" position="0.55 -0.265 0.002"></a-entity>
-          <a-entity ui-button="action: mill" position="0.17 -0.35 0.002"></a-entity>
-          <a-entity ui-button="action: attack" position="0.36 -0.35 0.002"></a-entity>
-          <a-entity ui-button="action: startle" position="0.55 -0.35 0.002"></a-entity>
-          <a-entity ui-button="action: pause" position="0.17 -0.435 0.002"></a-entity>
-          <a-entity ui-button="action: scatter" position="0.36 -0.435 0.002"></a-entity>
-          <a-entity ui-button="action: hide" position="0.55 -0.435 0.002"></a-entity>
+        <!-- 2D tank panel -->
+        <a-entity id="panel2" mode-visible="mode: tank" position="1.25 1.15 -0.55" rotation="-22 -58 0">
+          <a-entity grab-move="target: #panel2; label: Grab here to move panel; width: 0.6" position="0 0.52 0.002"></a-entity>
+          <a-plane width="1.46" height="0.975" position="0 -0.008 -0.004" material="shader: flat; color: #2a3b55; fog: false"></a-plane>
+          <a-plane width="1.44" height="0.955" position="0 -0.008 -0.002" material="shader: flat; color: #0b1320; fog: false"></a-plane>
+          <a-entity tank-info position="-0.355 -0.007 0.001"></a-entity>
+          <a-entity ui-slider="obj: P2; key: sep; min: 0; max: 3; step: 0.1; decimals: 1; label: Separation" position="0.36 0.420 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: ali; min: 0; max: 3; step: 0.1; decimals: 1; label: Alignment" position="0.36 0.345 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: coh; min: 0; max: 3; step: 0.1; decimals: 1; label: Cohesion" position="0.36 0.270 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: R; min: 16; max: 160; step: 4; decimals: 1; scale: 0.125; label: Perception radius; unit: BL" position="0.36 0.195 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: Rsep; min: 8; max: 64; step: 4; decimals: 1; scale: 0.125; label: Personal space; unit: BL" position="0.36 0.120 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: n; min: 10; max: 300; step: 10; label: Number of fish; rule: false" position="0.36 0.045 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: preds; min: 0; max: 4; step: 1; label: Predators; rule: false" position="0.36 -0.030 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: speed; min: 0.25; max: 3; step: 0.25; decimals: 2; label: Simulation speed; unit: ×; rule: false" position="0.36 -0.105 0.002"></a-entity>
+          <a-entity ui-button="action: p2:balanced; width: 0.18" position="0.170 -0.190 0.002"></a-entity>
+          <a-entity ui-button="action: p2:swarm; width: 0.18" position="0.360 -0.190 0.002"></a-entity>
+          <a-entity ui-button="action: p2:parallel; width: 0.18" position="0.550 -0.190 0.002"></a-entity>
+          <a-entity ui-button="action: p2:loners; width: 0.18" position="0.170 -0.275 0.002"></a-entity>
+          <a-entity ui-button="action: p2:attack; width: 0.18" position="0.360 -0.275 0.002"></a-entity>
+          <a-entity ui-button="action: pause2; width: 0.18" position="0.550 -0.275 0.002"></a-entity>
+          <a-entity ui-button="action: reset2; width: 0.18" position="0.170 -0.360 0.002"></a-entity>
+          <a-entity ui-button="action: explain; width: 0.37" position="0.455 -0.360 0.002"></a-entity>
+          <a-entity ui-button="action: toOcean; width: 0.37" position="0.265 -0.445 0.002"></a-entity>
+          <a-entity ui-button="action: hide; width: 0.18" position="0.550 -0.445 0.002"></a-entity>
+        </a-entity>
+
+        <!-- Tour panel -->
+        <a-entity id="explainer" mode-visible="mode: tour" position="1.3 1.2 -0.6" rotation="-22 -60 0">
+          <a-entity grab-move="target: #explainer; label: Grab here to move panel; width: 0.6" position="0 0.52 0.002"></a-entity>
+          <a-plane width="1.32" height="0.995" position="0 -0.018 -0.004" material="shader: flat; color: #2a3b55; fog: false"></a-plane>
+          <a-plane width="1.3" height="0.975" position="0 -0.018 -0.002" material="shader: flat; color: #0b1320; fog: false"></a-plane>
+          <a-entity explain-display position="0 0.105 0.001"></a-entity>
+          <a-entity ui-slider="obj: P2; key: sep; min: 0; max: 3; step: 0.1; decimals: 1; label: Separation; width: 0.56" position="-0.31 -0.300 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: ali; min: 0; max: 3; step: 0.1; decimals: 1; label: Alignment; width: 0.56" position="-0.31 -0.375 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: coh; min: 0; max: 3; step: 0.1; decimals: 1; label: Cohesion; width: 0.56" position="0.31 -0.300 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: R; min: 16; max: 160; step: 4; decimals: 1; scale: 0.125; label: Perception radius; unit: BL; width: 0.56" position="0.31 -0.375 0.002"></a-entity>
+          <a-entity ui-button="action: prev; width: 0.23" position="-0.5 -0.46 0.002"></a-entity>
+          <a-entity ui-button="action: next; width: 0.23" position="-0.25 -0.46 0.002"></a-entity>
+          <a-entity ui-button="action: play; width: 0.23" position="0.0 -0.46 0.002"></a-entity>
+          <a-entity ui-button="action: regroup; width: 0.23" position="0.25 -0.46 0.002"></a-entity>
+          <a-entity ui-button="action: exit; width: 0.23" position="0.5 -0.46 0.002"></a-entity>
         </a-entity>
       </a-entity>
 
