@@ -180,7 +180,7 @@ const STEPS = [
     params: {}, view: V({ equation: true }),
     slider: { key: 'eps', min: 0.5, max: 1, step: 0.01, decimals: 2, label: 'Greenhouse strength ε', unit: '' } },
   { title: 'Ice can tip the balance',
-    text: 'A colder planet has more ice, and ice reflects more sunlight, which makes it colder still. This feedback can tip a planet into a “Snowball Earth”. Lower the sunlight below about 1230 W/m² to freeze it. Then try raising it again: escaping is much harder than falling in.',
+    text: 'A colder planet has more ice, and ice reflects more sunlight, which makes it colder still. This feedback can tip a planet into a “Snowball Earth”. Lower the sunlight below about 1250 W/m² to freeze it. Then try raising it again: escaping needs about 1430 W/m², far more than today.',
     eq: 'Albedo rises as ice spreads, so cooling causes more cooling',
     params: { iceFeedback: true }, view: V({}),
     slider: { key: 'S0', min: 1000, max: 1500, step: 1, decimals: 0, label: 'Solar constant S₀', unit: 'W/m²' } }
@@ -940,7 +940,7 @@ AFRAME.registerComponent('grab-move', {
       tg.rotation.y = Math.atan2(this.cam.x - target.x, this.cam.z - target.z);   // keep facing the viewer
       tg.position.copy(target);
       tg.updateMatrix();
-      tg.position.sub(this.offset.clone().applyQuaternion(tg.quaternion));
+      tg.position.sub(this.offset.clone().multiply(tg.scale).applyQuaternion(tg.quaternion));
     }
     if (!this.data.label) return;
     const key = this.hover + '' + this.dragging;
@@ -1103,6 +1103,39 @@ AFRAME.registerComponent('auto-height', {
   }
 });
 
+// ---------- Zoom the planet system: thumbstick forward/back in VR, mouse wheel or + / - on a computer ----------
+AFRAME.registerComponent('stick-zoom', {
+  schema: { target: { type: 'selector' }, start: { type: 'number', default: 0.7 },
+            min: { type: 'number', default: 0.3 }, max: { type: 'number', default: 2.5 } },
+  init: function () {
+    this.s = this.data.start; this.keys = {}; this.down = {};
+    window.addEventListener('keydown', (e) => { this.keys[e.key] = true; });
+    window.addEventListener('keyup', (e) => { this.keys[e.key] = false; });
+    this.el.addEventListener('reset-poses', () => { this.s = this.data.start; });
+  },
+  zoomBy: function (f) { this.s = clamp(this.s * f, this.data.min, this.data.max); },
+  tick: function (t, dtMs) {
+    const dt = Math.min((dtMs || 16) / 1000, 0.1), sc = this.el;
+    if (!this.wheelOn && sc.canvas) {
+      this.wheelOn = true;
+      sc.canvas.addEventListener('wheel', (e) => this.zoomBy(Math.exp(-e.deltaY * 0.001)), { passive: true });
+    }
+    if (this.keys['+'] || this.keys['=']) this.zoomBy(Math.exp(dt));
+    if (this.keys['-']) this.zoomBy(Math.exp(-dt));
+    // thumbsticks are read straight from the headset's controllers; clicking a thumbstick resets the size
+    const ses = sc.is('vr-mode') && sc.renderer.xr.getSession ? sc.renderer.xr.getSession() : null;
+    if (ses) for (const inp of ses.inputSources) {
+      const gp = inp.gamepad; if (!gp) continue;
+      const ax = gp.axes, y = ax.length >= 4 ? ax[3] : (ax[1] || 0);
+      if (Math.abs(y) > 0.15) this.zoomBy(Math.exp(-y * dt * 1.2));
+      const pressed = !!(gp.buttons[3] && gp.buttons[3].pressed);
+      if (pressed && !this.down[inp.handedness]) this.s = this.data.start;
+      this.down[inp.handedness] = pressed;
+    }
+    this.data.target.object3D.scale.setScalar(this.s);
+  }
+});
+
 // ---------- Buttons ----------
 AFRAME.registerComponent('ui-button', {
   schema: { action: { type: 'string' }, width: { type: 'number', default: 0.27 } },
@@ -1175,13 +1208,14 @@ AFRAME.registerComponent('ui-button', {
       Desktop: drag to look around, WASD to move, click and drag sliders, handles and the Earth.
       Quest: open in the browser, press the VR button, point with either controller and
       hold the trigger to drag sliders, panels or the Earth; click the trigger for buttons.
+      Zoom: push either thumbstick forward or back (click it to reset); on a computer use the mouse wheel or + / -.
     -->
     <a-scene background="color: #03050a"
              light="defaultLightsEnabled: false"
              renderer="antialias: true; colorManagement: true"
              cursor="rayOrigin: mouse; fuse: false"
              raycaster="objects: .clickable; far: 20"
-             sim-runner star-field mode-manager auto-height="target: #stage">
+             sim-runner star-field mode-manager auto-height="target: #stage" stick-zoom="target: #system">
 
       <a-entity light="type: ambient; color: #9fb4d0; intensity: 0.3"></a-entity>
 

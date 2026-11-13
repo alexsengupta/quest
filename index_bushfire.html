@@ -17,8 +17,9 @@
 //   slope: McArthur's rule of thumb, speed doubles for every 10 degrees upslope: exp(0.069 * slope)
 //   moisture: exp(-0.11 (M - 6)), no spread at all above 25% moisture
 // Using 16 neighbours (including "knight's moves") avoids the octagon-shaped fires a simple grid gives.
-const N = 128, DX = 20, L = N * DX;          // cells per side, cell size (m), domain width (m)
-const HALF = (N - 1) / 2 * DX;               // distance from the centre to the outermost cell centres
+const L = 2560;                              // domain width (m)
+let N = 128, DX = L / N;                     // cells per side and cell size (m): 128 x 20 m, or 256 x 10 m on "Grid: 10 m"
+let HALF = (N - 1) / 2 * DX;                 // distance from the centre to the outermost cell centres
 const NONE = 0, GRASS = 1, FOREST = 2;
 const FUELS = [
   // R0: spread rate on flat ground, no wind, 6% moisture (m/min); flame / smoulder: how long a square
@@ -116,7 +117,9 @@ function genFuel(kind) {
 
 // The 16 neighbour steps. Diagonal and knight's moves may not slip through gaps in a firebreak.
 const NB = [];
-for (let dj = -2; dj <= 2; dj++) for (let di = -2; di <= 2; di++) {
+function buildStencil() {
+ NB.length = 0;
+ for (let dj = -2; dj <= 2; dj++) for (let di = -2; di <= 2; di++) {
   const a = Math.abs(di), b = Math.abs(dj);
   if (!((Math.max(a, b) === 1) || (a + b === 3))) continue;
   const len = Math.hypot(di, dj), nb = { di, dj, d: DX * len, ux: di / len, uz: dj / len, via: null, both: false };
@@ -124,7 +127,9 @@ for (let dj = -2; dj <= 2; dj++) for (let di = -2; di <= 2; di++) {
   else if (a === 2) { nb.via = [[di / 2, 0], [di / 2, dj]]; nb.both = true; }
   else if (b === 2) { nb.via = [[0, dj / 2], [di, dj / 2]]; nb.both = true; }
   NB.push(nb);
+ }
 }
+buildStencil();
 
 // A min-heap of (time, cell) pairs; out-of-date entries are skipped when popped
 const HEAP = {
@@ -212,7 +217,17 @@ function rebuildFront() {
   updateP();
   HEAP.clear();
   for (let c = 0; c < N * N; c++) if (SIM.state[c] === 0) SIM.tTent[c] = Infinity;
-  for (let c = 0; c < N * N; c++) if (SIM.state[c] !== 0) relaxFrom(c, SIM.tIgn[c], SIM.now);
+  const st = SIM.state;
+  for (let c = 0; c < N * N; c++) {
+    if (st[c] === 0) continue;
+    const i = c % N, j = (c / N) | 0;
+    let edge = false;      // only squares on the edge of the burnt area can spread fire further
+    for (let dj = -2; dj <= 2 && !edge; dj++) for (let di = -2; di <= 2; di++) {
+      const ii = i + di, jj = j + dj;
+      if (ii >= 0 && jj >= 0 && ii < N && jj < N && st[jj * N + ii] === 0) { edge = true; break; }
+    }
+    if (edge) relaxFrom(c, SIM.tIgn[c], SIM.now);
+  }
   SIM.dirty = false;
 }
 
@@ -273,7 +288,7 @@ function gauss() { return Math.sqrt(-2 * Math.log(emberRnd() + 1e-9)) * Math.cos
 function launchEmbers(dtSim) {
   const p = SIM.params, U = p.windSpeed;
   if (!p.spotting || U < 5 || SIM.embers.length > 160) return;
-  const rate = 0.003 * Math.pow(U / 30, 1.5);          // embers per minute from one flaming forest square
+  const rate = 0.003 * Math.pow(U / 30, 1.5) * (DX / 20) * (DX / 20);   // embers per minute from one flaming forest square
   const [wx, wz] = windToward();
   for (const c of SIM.active) {
     const f = SIM.fuel[c], age = SIM.now - SIM.tIgn[c];
@@ -362,6 +377,15 @@ function fmtTime(min) {
   return h > 0 ? `${h} h ${String(m % 60).padStart(2, '0')} min` : `${m} min`;
 }
 
+// Switch between a 128 x 128 (20 m) and a 256 x 256 (10 m) grid. The landscape is regenerated and the fire reset.
+function setResolution(n) {
+  N = n; DX = L / N; HALF = (N - 1) / 2 * DX;
+  for (const k of ['h', 'fuel', 'state', 'tIgn', 'ros', 'tTent', 'rTent']) SIM[k] = new SIM[k].constructor(N * N);
+  buildStencil();
+  genTerrain(SIM.terrain); genFuel(SIM.fuelMap); resetFire();
+  if (WORLD.comp) WORLD.comp.rebuildGrid();
+}
+
 genTerrain('hills'); genFuel('mixed'); resetFire();
 
 // ===================== VIEW STATE AND EXPLAINER STEPS =====================
@@ -385,7 +409,7 @@ const STEPS = [
     setup: { terrain: 'flat', fuel: 'grass' }, params: { windSpeed: 30, windDir: 270, speed: 2 }, ignite: [[-900, 0]],
     slider: { key: 'windSpeed', min: 0, max: 60, step: 1, decimals: 0, label: 'Wind speed', unit: 'km/h' } },
   { title: 'Fires run uphill',
-    text: 'On a slope the flames lean towards the fuel above them and pre-heat it, so fires race uphill and slow down going downhill. A rule of thumb from Australian research: every 10° of upward slope roughly doubles the speed. There is no wind here. Switch the slope effect off and replay to compare, or use "Stand here" to watch from the hilltop.',
+    text: 'On a slope the flames lean towards the fuel above them and pre-heat it, so fires race uphill and slow down going downhill. A rule of thumb from Australian research: every 10° of upward slope roughly doubles the speed. There is no wind here. Switch the slope effect off and replay to compare: the fire stays almost a circle.',
     eq: 'Slope factor  ≈  e^(0.069 θ)  ≈  2^(θ ÷ 10°)       (McArthur’s rule of thumb, θ = slope)',
     setup: { terrain: 'hill', fuel: 'grass' }, params: { windSpeed: 0, speed: 3 }, ignite: [[0, 680]],
     toggle: 'slope' },
@@ -418,6 +442,8 @@ const STEPS = [
 function applyStep(i) {
   SIM.step = clamp(i, 0, STEPS.length - 1);
   const st = STEPS[SIM.step];
+  // the explainer is viewed on the tabletop, with the whole map in view, so the fire's shape is easy to see
+  Object.assign(SIM.view, { mode: 'table', yaw: 0, zoom: 1, panX: 0, panZ: 0 });
   if (st.keep) return;
   genTerrain(st.setup.terrain); genFuel(st.setup.fuel);
   resetFire();
@@ -792,7 +818,13 @@ AFRAME.registerComponent('fire-world', {
     const base = new THREE.Mesh(new THREE.PlaneGeometry(2 * HALF, 2 * HALF).rotateX(Math.PI / 2),
                                 new THREE.MeshBasicMaterial({ color: '#17110c' }));
     base.position.y = -70;
+    this.skirt = skirt; this.base = base;
     this.g.add(skirt, base);
+  },
+  rebuildGrid: function () {
+    for (const m of [this.terrain, this.skirt, this.base, this.trees]) { this.g.remove(m); m.geometry.dispose(); }
+    this.buildTerrain(); this.buildSkirt(); this.buildTrees();
+    this.tv = -1; this.fv = -1; this.treeDirty = true; this.lastFull = 0; this.lastBurnt = 0;
   },
   updateTerrain: function () {
     const pos = this.tGeo.attributes.position.array;
@@ -827,7 +859,7 @@ AFRAME.registerComponent('fire-world', {
     this.cellTree.fill(-1); this.lastTreeFull = 0;
     for (let c = 0; c < N * N; c++) {
       const r1 = rnd(), r2 = rnd(), r3 = rnd(), r4 = rnd(), r5 = rnd(), r6 = rnd();
-      if (SIM.fuel[c] !== FOREST || r1 > 0.55) continue;
+      if (SIM.fuel[c] !== FOREST || r1 > 0.55 * (DX / 20) * (DX / 20)) continue;   // same trees per hectare on any grid
       const x = cellX(c % N) + (r2 - 0.5) * DX * 0.8, z = cellX((c / N) | 0) + (r3 - 0.5) * DX * 0.8;
       const H = 12 + 12 * r4, W = H * 0.85;
       p.set(x, heightAt(x, z) - 0.5, z); q.setFromAxisAngle(Y, r6 * 6.28); s.set(W, H, W);
@@ -1272,7 +1304,8 @@ AFRAME.registerComponent('terrain-tools', {
       comp.setRing(k, hit, Math.max(tool.r, 0.012 / scale), tool.color);
       if (s.held && hit) this.apply(s, hit, dt);
     });
-    // thumbsticks
+    // thumbsticks: read straight from the XR gamepads (more reliable than waiting for events)
+    if (vr) this.pollGamepads();
     const Ls = this.src[1].axes, Rs = this.src[2].axes;
     if (v.mode === 'table') {
       if (Math.abs(Rs[0]) > 0.15) v.yaw -= Rs[0] * dt * 1.4;
@@ -1291,6 +1324,22 @@ AFRAME.registerComponent('terrain-tools', {
       if (px || pz) this.pan(px, pz, dt);
     } else {
       if (K.q) v.gyaw += dt * 1.2; if (K.e) v.gyaw -= dt * 1.2;
+    }
+  },
+  pollGamepads: function () {
+    const ses = this.el.renderer && this.el.renderer.xr.getSession && this.el.renderer.xr.getSession();
+    if (!ses) return;
+    for (const inp of ses.inputSources) {
+      const gp = inp.gamepad, k = inp.handedness === 'left' ? 1 : inp.handedness === 'right' ? 2 : 0;
+      if (!gp || !k) continue;
+      const ax = gp.axes, s = this.src[k];
+      s.axes = ax.length >= 4 ? [ax[2], ax[3]] : [ax[0] || 0, ax[1] || 0];
+      const pressed = !!(gp.buttons[3] && gp.buttons[3].pressed);     // clicking a thumbstick resets the view
+      if (pressed && !s.stickDown) {
+        const v = SIM.view;
+        if (v.mode === 'table') { v.yaw = 0; v.zoom = 1; v.panX = 0; v.panZ = 0; }
+      }
+      s.stickDown = pressed;
     }
   },
   // slide the table: (dx, dz) in the viewer's own frame, +dz towards the viewer
@@ -1506,6 +1555,7 @@ AFRAME.registerComponent('ui-button', {
       case 'streaks': p.streaks = !p.streaks; break;
       case 'pause': p.paused = !p.paused; break;
       case 'resetfire': resetFire(); break;
+      case 'res': setResolution(N === 128 ? 256 : 128); break;
       case 'view':
         if (SIM.view.mode === 'table') { const [x, z] = lookoutPoint(); enterGround(x, z); }
         else SIM.view.mode = 'table';
@@ -1536,7 +1586,8 @@ AFRAME.registerComponent('ui-button', {
       case 'streaks': return [`Wind streaks: ${onOff(p.streaks)}`, p.streaks];
       case 'pause': return [p.paused ? '▶  Resume' : '❚❚  Pause', p.paused];
       case 'resetfire': return ['↺  Reset fire', false];
-      case 'view': return [SIM.view.mode === 'table' ? 'Stand on the highest hill  ▸' : '◀  Back to the tabletop', SIM.view.mode !== 'table'];
+      case 'view': return [SIM.view.mode === 'table' ? 'Stand on hilltop  ▸' : '◀  Tabletop', SIM.view.mode !== 'table'];
+      case 'res': return [`Grid: ${DX} m squares  ▸`, N > 128];
       case 'explain': return ['Explain step by step  ▶', true];
       case 'prev': return ['◀  Back', false];
       case 'next': return [SIM.step < STEPS.length - 1 ? 'Next  ▶' : 'Finish  ✓', true];
@@ -1665,7 +1716,7 @@ AFRAME.registerComponent('tool-hint', {
   },
   tick: function () {
     const vr = this.el.sceneEl.is('vr-mode'), v = SIM.view.mode;
-    const ctl = vr ? (v === 'table' ? 'Right thumbstick: turn and zoom the map. Left thumbstick: slide it.'
+    const ctl = vr ? (v === 'table' ? 'Right thumbstick: push left/right to turn the map, forward/back to zoom. Left thumbstick: slide it. Click a thumbstick to reset.'
                                     : 'Right thumbstick: turn. You are standing in the landscape at full size.')
                    : (v === 'table' ? 'Mouse: drag to look, WASD to move. Q / E turn the map, R / F or the wheel zoom, arrow keys slide it.'
                                     : 'Drag to look around. Q / E turn.');
@@ -1824,7 +1875,8 @@ AFRAME.registerComponent('auto-height', {
           <a-entity ui-button="action: streaks" position="0.505 -0.04 0.002"></a-entity>
           <a-entity ui-button="action: pause" position="0.215 -0.13 0.002"></a-entity>
           <a-entity ui-button="action: resetfire" position="0.505 -0.13 0.002"></a-entity>
-          <a-entity ui-button="action: view; width: 0.56" position="0.36 -0.22 0.002"></a-entity>
+          <a-entity ui-button="action: view" position="0.215 -0.22 0.002"></a-entity>
+          <a-entity ui-button="action: res" position="0.505 -0.22 0.002"></a-entity>
           <a-entity ui-button="action: explain; width: 0.56" position="0.36 -0.31 0.002"></a-entity>
         </a-entity>
 
