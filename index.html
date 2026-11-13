@@ -113,6 +113,77 @@ function setAtmosphere(on) {
 
 resetSim();
 
+// ===================== VIEW STATE AND EXPLAINER STEPS =====================
+SIM.mode = 'main';          // 'main' or 'explain'
+SIM.step = 0;
+SIM.showArrows = true;
+SIM.showEq = false;
+
+const ALL_ARROWS = ['in', 'refl', 'surf', 'back', 'olr'];
+function V(o) {
+  return Object.assign({ beam: true, sw: true, refl: true, surfIR: true, atmEmit: true, shell: true,
+                         shadow: false, arrows: ALL_ARROWS, showTemp: true }, o);
+}
+
+const STEPS = [
+  { title: 'Energy from the Sun',
+    text: 'Sunlight carries energy. Where Earth orbits, each square metre facing the Sun receives about 1361 watts, roughly what a microwave oven uses. This is called the solar constant. Try changing it with the slider and watch the stream of sunlight change.',
+    eq: 'Solar constant:  S₀ ≈ 1361 W/m²',
+    params: {}, view: V({ refl: false, surfIR: false, atmEmit: false, shell: false, arrows: ['in'], showTemp: false }),
+    slider: { key: 'S0', min: 1000, max: 1700, step: 1, decimals: 0, label: 'Solar constant S₀', unit: 'W/m²' } },
+  { title: 'Why we divide by four',
+    text: 'Earth catches sunlight on a disc the size of its shadow (the yellow ring). But Earth spins, so that energy is shared over its whole surface, which is four times the area of the disc. On average, each square metre of Earth receives a quarter of the solar constant: about 340 W/m².',
+    eq: 'Average sunlight = S₀ × πR² ÷ 4πR² = S₀ / 4 ≈ 340 W/m²',
+    params: {}, view: V({ refl: false, surfIR: false, atmEmit: false, shell: false, arrows: ['in'], shadow: true, showTemp: false }) },
+  { title: 'Some sunlight bounces straight back',
+    text: 'Clouds, ice and other bright surfaces reflect some sunlight back to space before it can warm anything. The fraction reflected is the albedo. Earth’s is about 0.3, so 30% bounces off. Move the slider and watch the reflected arrow grow and shrink.',
+    eq: 'Reflected = α × S₀/4        Absorbed = (1 − α) × S₀/4',
+    params: {}, view: V({ surfIR: false, atmEmit: false, shell: false, arrows: ['in', 'refl'], showTemp: false }),
+    slider: { key: 'albedo', min: 0, max: 0.9, step: 0.01, decimals: 2, label: 'Albedo α', unit: '' } },
+  { title: 'Warm things glow in infrared',
+    text: 'Everything gives off invisible infrared light, and warmer things give off much more: doubling the temperature (in kelvin) gives 16 times the energy. So a planet warms or cools until the infrared it gives off (orange) balances the sunlight it absorbs. Here the planet has no atmosphere, so watch it cool.',
+    eq: 'Infrared emitted = σT⁴,   σ = 5.67 × 10⁻⁸ W m⁻² K⁻⁴',
+    params: { atmosphere: false }, view: V({ atmEmit: false, arrows: ['in', 'refl', 'surf'] }) },
+  { title: 'A planet without an atmosphere',
+    text: 'When the infrared leaving balances the sunlight absorbed, the temperature stops changing. For Earth with no atmosphere, that balance comes at about −18 °C: a frozen world. But Earth’s real average is about +15 °C. Something is missing.',
+    eq: '(1 − α) S₀/4 = σT⁴   →   T ≈ 255 K ≈ −18 °C',
+    params: { atmosphere: false }, view: V({ atmEmit: false, arrows: ['in', 'refl', 'surf'] }) },
+  { title: 'The atmosphere traps infrared',
+    text: 'Gases such as water vapour and carbon dioxide let sunlight pass through, but absorb much of the infrared rising from the surface. In this model the atmosphere (the blue shell) absorbs 78% of it. Notice that the orange stream now mostly stops at the shell.',
+    eq: 'Absorbed by atmosphere = ε × σTₛ⁴,   ε ≈ 0.78',
+    params: {}, view: V({ atmEmit: false, arrows: ['in', 'refl', 'surf'] }) },
+  { title: 'Back-radiation warms the surface',
+    text: 'The atmosphere warms up and glows in infrared too (pink), sending energy both out to space and back down to the ground. The surface now receives sunlight plus this back-radiation, so it warms until everything balances again, at about +15 °C. This is the greenhouse effect.',
+    eq: 'Tₛ = Tₑ × (2 / (2 − ε))^¼   with   Tₑ = 255 K',
+    params: {}, view: V({}),
+    slider: { key: 'eps', min: 0, max: 1, step: 0.01, decimals: 2, label: 'Greenhouse strength ε', unit: '' } },
+  { title: 'Out of balance',
+    text: 'If something changes, such as adding greenhouse gases, the planet is briefly out of balance: more energy arrives than leaves. The extra energy warms the planet until balance returns. Raise the greenhouse strength and watch the imbalance appear, then shrink as the temperature rises.',
+    eq: 'Heat capacity × (rate of warming) = energy in − energy out',
+    params: {}, view: V({}),
+    slider: { key: 'eps', min: 0.5, max: 1, step: 0.01, decimals: 2, label: 'Greenhouse strength ε', unit: '' } },
+  { title: 'Ice can tip the balance',
+    text: 'A colder planet has more ice, and ice reflects more sunlight, which makes it colder still. This feedback can tip a planet into a “Snowball Earth”. Lower the sunlight below about 1230 W/m² to freeze it. Then try raising it again: escaping is much harder than falling in.',
+    eq: 'Albedo rises as ice spreads, so cooling causes more cooling',
+    params: { iceFeedback: true }, view: V({}),
+    slider: { key: 'S0', min: 1000, max: 1500, step: 1, decimals: 0, label: 'Solar constant S₀', unit: 'W/m²' } }
+];
+
+function currentView() {
+  if (SIM.mode === 'explain') return STEPS[SIM.step].view;
+  return V({ arrows: SIM.showArrows ? ALL_ARROWS : [] });
+}
+
+function applyStep(i) {
+  SIM.step = Math.max(0, Math.min(STEPS.length - 1, i));
+  const wasAtm = SIM.params.atmosphere;
+  Object.assign(SIM.params, DEFAULTS, STEPS[SIM.step].params, { speed: 2 });
+  if (!wasAtm && SIM.params.atmosphere) SIM.Ta = SIM.Ts * Math.pow(2, -0.25);
+}
+
+function enterExplainer() { resetSim(); SIM.mode = 'explain'; applyStep(0); }
+function exitExplainer() { SIM.mode = 'main'; resetSim(); }
+
 // ===================== GRAPHICS AND INTERFACE =====================
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
 const COL = {
@@ -150,6 +221,80 @@ function tempColor(c) {
     }
   }
   return 'rgb(' + stops[stops.length - 1][1].join(',') + ')';
+}
+
+
+// A text label that always faces the viewer
+function makeLabelSprite(text, color, widthM) {
+  const cv = document.createElement('canvas'); cv.width = 1024; cv.height = 112;
+  const c = cv.getContext('2d');
+  c.font = `600 52px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.shadowColor = 'rgba(0,0,0,0.95)'; c.shadowBlur = 12; c.fillStyle = color;
+  c.fillText(text, 512, 58);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true, depthTest: false, depthWrite: false }));
+  sp.scale.set(widthM, widthM * 112 / 1024, 1); sp.renderOrder = 10;
+  return sp;
+}
+
+// A flat arrow whose width is proportional to a flux, turned about its own axis to face the viewer
+const ARROW_SCALE = 0.12 / 340;   // metres of arrow width per W/m2
+class FluxArrow {
+  constructor(color) {
+    this.mesh = new THREE.Mesh(new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color(color), transparent: true, opacity: 0.6,
+                                    side: THREE.DoubleSide, depthWrite: false }));
+    this.mesh.renderOrder = 5;
+    this.cv = document.createElement('canvas'); this.cv.width = 256; this.cv.height = 96;
+    this.ctx = this.cv.getContext('2d');
+    this.tex = new THREE.CanvasTexture(this.cv); this.tex.colorSpace = THREE.SRGBColorSpace;
+    this.label = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex, transparent: true, depthTest: false, depthWrite: false }));
+    this.label.scale.set(0.2, 0.075, 1); this.label.renderOrder = 11;
+    this.color = color; this.key = ''; this.val = null;
+    this.X = new THREE.Vector3(); this.N = new THREE.Vector3(); this.M = new THREE.Matrix4();
+  }
+  set(visible, value, start, dir, len, head, cam, labelAt) {
+    this.mesh.visible = !!visible; this.label.visible = !!visible;
+    if (!visible) return;
+    const w = Math.max(value * ARROW_SCALE, 0.002);
+    const key = w.toFixed(3) + '|' + len.toFixed(3) + '|' + head;
+    if (key !== this.key) {
+      this.key = key;
+      const s = new THREE.Shape(), hw = w / 2;
+      if (head) {
+        const h = Math.min(Math.max(w * 0.9, 0.05), len * 0.45), aw = hw + Math.max(w * 0.35, 0.025);
+        s.moveTo(-hw, 0); s.lineTo(hw, 0); s.lineTo(hw, len - h); s.lineTo(aw, len - h);
+        s.lineTo(0, len); s.lineTo(-aw, len - h); s.lineTo(-hw, len - h); s.lineTo(-hw, 0);
+      } else {
+        s.moveTo(-hw, 0); s.lineTo(hw, 0); s.lineTo(hw, len); s.lineTo(-hw, len); s.lineTo(-hw, 0);
+      }
+      this.mesh.geometry.dispose();
+      this.mesh.geometry = new THREE.ShapeGeometry(s);
+    }
+    // orient: local +y along the arrow, local +z turned toward the camera
+    this.mesh.position.copy(start);
+    this.N.copy(cam).sub(start).normalize();
+    this.N.addScaledVector(dir, -this.N.dot(dir));
+    if (this.N.lengthSq() < 1e-6) this.N.set(0, 0, 1);
+    this.N.normalize();
+    this.X.crossVectors(dir, this.N);
+    this.M.makeBasis(this.X, dir, this.N);
+    this.mesh.quaternion.setFromRotationMatrix(this.M);
+    // label beyond the tip (labelAt = 1), at the start (negative), or alongside (0.5)
+    const off = labelAt < 0 ? labelAt : (labelAt === 1 ? len + 0.09 : len * 0.5);
+    this.label.position.copy(start).addScaledVector(dir, off);
+    if (labelAt === 0.5) this.label.position.addScaledVector(this.X, w / 2 + 0.11);
+    const v = Math.round(value);
+    if (v !== this.val) {
+      this.val = v;
+      const c = this.ctx; c.clearRect(0, 0, 256, 96);
+      c.textAlign = 'center'; c.textBaseline = 'middle';
+      c.shadowColor = 'rgba(0,0,0,0.95)'; c.shadowBlur = 10; c.fillStyle = this.color;
+      c.font = `700 48px ${FONT}`; c.fillText(String(v), 128, 38);
+      c.font = `26px ${FONT}`; c.fillText('W/m²', 128, 78);
+      this.tex.needsUpdate = true;
+    }
+  }
 }
 
 // ---------- Procedural Earth texture (no image files needed) ----------
@@ -272,8 +417,8 @@ AFRAME.registerComponent('star-field', {
 // ---------- Earth, Sun, atmosphere and flux particles ----------
 AFRAME.registerComponent('planet-system', {
   init: function () {
-    const R = 0.6, RA = 0.78, SUN = 2.7;
-    this.R = R; this.RA = RA; this.RMAX = 2.3; this.X0 = SUN - 0.42;
+    const R = 0.6, RA = 0.85, SUN = 2.7;
+    this.R = R; this.RA = RA; this.RMAX = 2.4; this.X0 = SUN - 0.42;
     this.VSW = 1.3; this.VIR = 0.55; this.K = 0.35;   // speeds (m/s); particles per second per W/m2
     const g = this.el.object3D;
 
@@ -322,7 +467,38 @@ AFRAME.registerComponent('planet-system', {
     this.beamMat = new THREE.MeshBasicMaterial({ color: 0xffe9a0, transparent: true, opacity: 0.05,
       blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
     const beam = new THREE.Mesh(new THREE.CylinderGeometry(R, R, len, 64, 1, true), this.beamMat);
-    beam.rotation.z = Math.PI / 2; beam.position.x = -len / 2; g.add(beam);
+    beam.rotation.z = Math.PI / 2; beam.position.x = -len / 2; g.add(beam); this.beam = beam;
+
+    // Explainer: a ring marking the intercepting disc, and Earth's shadow behind it
+    this.shadowGrp = new THREE.Group(); g.add(this.shadowGrp);
+    const ring = new THREE.Mesh(new THREE.RingGeometry(R - 0.012, R + 0.012, 96),
+      new THREE.MeshBasicMaterial({ color: 0xffe066, side: THREE.DoubleSide }));
+    ring.rotation.y = Math.PI / 2; ring.position.x = -1.0; this.shadowGrp.add(ring);
+    const shadow = new THREE.Mesh(new THREE.CylinderGeometry(R, R, 1.6, 64, 1, true),
+      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false }));
+    shadow.rotation.z = Math.PI / 2; shadow.position.x = 0.8; this.shadowGrp.add(shadow);
+    const lDisc = makeLabelSprite('Disc: area πR²', '#ffe066', 0.5); lDisc.position.set(-1.0, R + 0.12, 0); this.shadowGrp.add(lDisc);
+    const lSph = makeLabelSprite('Whole surface: area 4πR²', '#ffffff', 0.62); lSph.position.set(0, -R - 0.14, 0.3); this.shadowGrp.add(lSph);
+    const lSh = makeLabelSprite('Earth’s shadow', '#aab4c8', 0.42); lSh.position.set(1.0, R + 0.1, 0); this.shadowGrp.add(lSh);
+
+    // Energy-budget arrows: width proportional to each flux
+    const nrm = (x, y, z) => new THREE.Vector3(x, y, z).normalize();
+    this.dirs = { in: nrm(-0.85, 0.35, 0.4), refl: nrm(-0.75, -0.35, 0.55),
+                  surf: nrm(0.55, 0.55, 0.62), back: nrm(0.75, -0.35, 0.56) };
+    this.arrows = {};
+    const mk = (key, color) => { const a = new FluxArrow(color); g.add(a.mesh); g.add(a.label); this.arrows[key] = a; };
+    mk('in', COL.sun); mk('refl', COL.reflected); mk('surf', COL.surfIR); mk('back', COL.atmIR); mk('olr', '#ffb07a');
+    this.camLocal = new THREE.Vector3();
+
+    // Invisible sphere that the controller / mouse ray can hit, so the planet can be grabbed
+    const hit = new THREE.Mesh(new THREE.SphereGeometry(RA, 16, 12),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }));
+    this.el.setObject3D('hit', hit);
+    this.el.classList.add('clickable');
+    this.hint = makeLabelSprite('Hold trigger on Earth to move it', '#ffd166', 0.8);
+    this.hint.position.set(0, -RA - 0.12, 0.2); this.hint.visible = false; g.add(this.hint);
+    this.el.addEventListener('mouseenter', () => { this.hovering = true; });
+    this.el.addEventListener('mouseleave', () => { this.hovering = false; });
 
     // Sunlight on the Earth
     const light = new THREE.DirectionalLight(0xffffff, 3.2);
@@ -364,6 +540,26 @@ AFRAME.registerComponent('planet-system', {
     return [r * Math.cos(ph), z, r * Math.sin(ph)];
   },
 
+  updateArrows: function (view) {
+    const p = SIM.params, f = SIM.f, R = this.R, RA = this.RA, d = this.dirs, A = this.arrows;
+    const show = k => view.arrows.indexOf(k) >= 0;
+    const atm = p.atmosphere && view.shell;
+    this.el.sceneEl.camera.getWorldPosition(this.camLocal);
+    this.el.object3D.worldToLocal(this.camLocal);
+    const cam = this.camLocal;
+    const tmp = new THREE.Vector3();
+    A.in.set(show('in'), f.Q, tmp.copy(d.in).multiplyScalar(R + 0.95), d.in.clone().negate(), 0.93, true, cam, -0.1);
+    A.refl.set(show('refl'), f.reflected, tmp.copy(d.refl).multiplyScalar(R * 1.02), d.refl, 0.9, true, cam, 1);
+    if (atm) {
+      A.surf.set(show('surf'), f.surfIR, tmp.copy(d.surf).multiplyScalar(R * 1.02), d.surf, RA - R * 1.02, false, cam, 0.5);
+      A.olr.set(show('olr'), f.olr, tmp.copy(d.surf).multiplyScalar(RA), d.surf, 0.75, true, cam, 1);
+      A.back.set(show('back'), f.back, tmp.copy(d.back).multiplyScalar(RA), d.back.clone().negate(), RA - R * 1.02, true, cam, -0.1);
+    } else {
+      A.surf.set(show('surf'), f.surfIR, tmp.copy(d.surf).multiplyScalar(R * 1.02), d.surf, 1.0, true, cam, 1);
+      A.olr.set(false); A.back.set(false);
+    }
+  },
+
   tick: function (time, dtMs) {
     if (!dtMs) return;
     const dt = Math.min(dtMs / 1000, 0.05), p = SIM.params, f = SIM.f;
@@ -372,15 +568,21 @@ AFRAME.registerComponent('planet-system', {
     this.earth.rotation.y += dt * 0.1;
     const edge = iceEdgeLat(SIM.Ts);
     if (Math.abs(edge - this.lastEdge) > 0.4) { drawIce(this.E, edge); this.lastEdge = edge; }
-    this.shell.visible = p.atmosphere;
+    const view = currentView(); this.view = view;
+    this.shell.visible = p.atmosphere && view.shell;
+    this.beam.visible = view.beam;
+    this.shadowGrp.visible = view.shadow;
+    this.hint.visible = !!this.hovering && SIM.mode === 'main';
+    this.updateArrows(view);
     this.shellMat.uniforms.strength.value = 0.15 + 1.1 * p.eps;
     const sRel = p.S0 / 1361;
     this.glow.scale.setScalar(2.3 * Math.sqrt(sRel));
     this.beamMat.opacity = 0.05 * sRel;
 
     // Spawn particles at rates proportional to each flux
-    const rates = [this.K * f.Q, 0, this.K * f.surfIR,
-                   p.atmosphere ? this.K * f.atmUp : 0, p.atmosphere ? this.K * f.back : 0];
+    const atmOn = p.atmosphere && view.atmEmit;
+    const rates = [view.sw ? this.K * f.Q : 0, 0, view.surfIR ? this.K * f.surfIR : 0,
+                   atmOn ? this.K * f.atmUp : 0, atmOn ? this.K * f.back : 0];
     for (const k of [0, 2, 3, 4]) {
       this.acc[k] += rates[k] * dt;
       while (this.acc[k] >= 1) {
@@ -406,6 +608,7 @@ AFRAME.registerComponent('planet-system', {
       if (t === 0) {
         if (r <= R) {
           if (Math.random() < f.a) {                 // reflected: bounce off with some scatter
+            if (!view.refl) { this.remove(i); continue; }
             const nx = x / r, ny = y / r, nz = z / r;
             const d = this.vx[i] * nx + this.vy[i] * ny + this.vz[i] * nz;
             let rx = this.vx[i] - 2 * d * nx + 0.6 * this.VSW * nx + 0.4 * this.VSW * (Math.random() - 0.5);
@@ -460,11 +663,15 @@ AFRAME.registerComponent('world-label', {
     ctx.fillStyle = d.color; ctx.fillText(d.text, 512, 50);
     c.tex.needsUpdate = true;
     this.el.object3D.add(c.mesh);
-    const pos = this.el.object3D.position;
-    this.el.object3D.rotation.y = Math.atan2(-pos.x, -pos.z);
+    this.cam = new THREE.Vector3(); this.me = new THREE.Vector3();
   },
   tick: function () {
-    if (this.data.showIf) this.el.object3D.visible = !!SIM.params[this.data.showIf];
+    const o = this.el.object3D;
+    o.visible = SIM.mode === 'main' && (!this.data.showIf || !!SIM.params[this.data.showIf]);
+    if (!o.visible) return;
+    this.el.sceneEl.camera.getWorldPosition(this.cam); o.getWorldPosition(this.me);
+    const parentYaw = o.parent ? new THREE.Euler().setFromQuaternion(o.parent.getWorldQuaternion(new THREE.Quaternion()), 'YXZ').y : 0;
+    o.rotation.y = Math.atan2(this.cam.x - this.me.x, this.cam.z - this.me.z) - parentYaw;
   }
 });
 
@@ -561,10 +768,10 @@ AFRAME.registerComponent('ui-slider', {
   schema: { key: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' },
             step: { type: 'number', default: 1 }, decimals: { type: 'int', default: 0 },
             label: { type: 'string' }, unit: { type: 'string', default: '' },
-            width: { type: 'number', default: 0.56 }, enabledIf: { type: 'string', default: '' } },
+            width: { type: 'number', default: 0.56 }, enabledIf: { type: 'string', default: '' },
+            dynamic: { type: 'boolean', default: false } },
   init: function () {
     const d = this.data, w = d.width, o = new THREE.Group();
-    this.el.classList.add('clickable');
     const basic = (col, opts) => new THREE.MeshBasicMaterial(Object.assign({ color: col, transparent: true }, opts || {}));
     this.label = makeCanvasPlane(w, 640, 52);
     this.label.mesh.position.set(0, 0.028, 0.001); o.add(this.label.mesh);
@@ -601,6 +808,14 @@ AFRAME.registerComponent('ui-slider', {
   },
   tick: function () {
     const d = this.data;
+    let shown = panelActive(this.el);
+    if (d.dynamic) {                      // explainer slider: takes its settings from the current step
+      const cfg = SIM.mode === 'explain' ? STEPS[SIM.step].slider : null;
+      if (cfg) Object.assign(d, cfg); else shown = false;
+      this.el.object3D.visible = !!cfg;
+    }
+    setClickable(this.el, shown);
+    if (!shown) { this.dragging = false; return; }
     if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
       this.setFromHit(this.cursorEl.components.raycaster.getIntersection(this.el));
     }
@@ -611,7 +826,7 @@ AFRAME.registerComponent('ui-slider', {
     this.trackMat.opacity = a; this.fillMat.opacity = a; this.knobMat.opacity = a; this.label.mat.opacity = a;
     this.knobMat.color.set(en && (this.hover || this.dragging) ? '#ffd166' : '#eef3f8');
     this.knob.scale.setScalar(en && (this.hover || this.dragging) ? 1.25 : 1);
-    const txt = `${d.label}|${v.toFixed(d.decimals)} ${d.unit}`;
+    const txt = `${d.label}|${v.toFixed(d.decimals)} ${d.unit}|${d.min}|${d.max}`;
     if (txt !== this.drawn) {
       this.drawn = txt;
       const c = this.label.ctx; c.clearRect(0, 0, 640, 52);
@@ -623,6 +838,22 @@ AFRAME.registerComponent('ui-slider', {
   }
 });
 
+
+// An element is clickable only while its panel's mode is showing (hidden panels must not catch the pointer)
+function panelActive(el) {
+  if (el._modeEl === undefined) el._modeEl = el.closest('[mode-visible]');
+  return !el._modeEl || el._modeEl.getAttribute('mode-visible').mode === SIM.mode;
+}
+function setClickable(el, on) {
+  if (el._clickable === on) return;
+  el._clickable = on;
+  if (on) el.classList.add('clickable'); else el.classList.remove('clickable');
+}
+
+AFRAME.registerComponent('mode-visible', {
+  schema: { mode: { type: 'string', default: 'main' } },
+  tick: function () { this.el.object3D.visible = SIM.mode === this.data.mode; }
+});
 
 // While dragging with the mouse, stop the camera from rotating; call onUp when released
 function holdLook(cursorEl, onUp) {
@@ -637,42 +868,50 @@ function holdLook(cursorEl, onUp) {
   cursorEl.addEventListener('mouseup', up);
 }
 
-// ---------- Drag handle: point at it, hold the trigger (or mouse button) and move the panel ----------
-AFRAME.registerComponent('panel-grab', {
-  schema: { target: { type: 'selector' }, width: { type: 'number', default: 0.6 } },
+// ---------- Grab and move: a handle bar on panels, or the planet itself ----------
+function copyPose(fromSel, toSel) {
+  const a = document.querySelector(fromSel).object3D, b = document.querySelector(toSel).object3D;
+  b.position.copy(a.position); b.rotation.y = a.rotation.y;
+}
+
+AFRAME.registerComponent('grab-move', {
+  schema: { target: { type: 'selector' }, label: { type: 'string', default: '' }, width: { type: 'number', default: 0.6 } },
   init: function () {
-    this.el.classList.add('clickable');
-    this.c = makeCanvasPlane(this.data.width, 768, 80);
-    const grp = new THREE.Group(); grp.add(this.c.mesh);
-    this.el.setObject3D('ui', grp);
+    if (this.data.label) {
+      this.c = makeCanvasPlane(this.data.width, 768, 80);
+      const grp = new THREE.Group(); grp.add(this.c.mesh);
+      this.el.setObject3D('ui', grp);
+    }
     this.hover = false; this.dragging = false; this.drawn = '';
     this.offset = new THREE.Vector3(); this.tmp = new THREE.Vector3(); this.cam = new THREE.Vector3();
+    const t = this.data.target.object3D;
+    this.home = { p: t.position.clone(), y: t.rotation.y };
+    this.el.sceneEl.addEventListener('reset-poses', () => { t.position.copy(this.home.p); t.rotation.y = this.home.y; });
     this.el.addEventListener('mouseenter', () => { this.hover = true; });
     this.el.addEventListener('mouseleave', () => { this.hover = false; });
     this.el.addEventListener('mousedown', (e) => {
-      const hit = e.detail.intersection; if (!hit) return;
+      const hit = e.detail.intersection; if (!hit || !panelActive(this.el)) return;
       this.cursorEl = e.detail.cursorEl; this.dragging = true;
       this.dist = hit.distance;
-      const panel = this.data.target.object3D;
-      panel.updateMatrixWorld(true);
-      this.offset.copy(panel.worldToLocal(hit.point.clone()));   // grab point in panel coordinates
+      const tg = this.data.target.object3D;
+      tg.updateMatrixWorld(true);
+      this.offset.copy(tg.worldToLocal(hit.point.clone()));   // grab point in the target's own coordinates
       holdLook(this.cursorEl, () => { this.dragging = false; });
     });
   },
   tick: function () {
+    if (this.data.label) setClickable(this.el, panelActive(this.el));
     if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
       const ray = this.cursorEl.components.raycaster.raycaster.ray;
-      const panel = this.data.target.object3D, parent = panel.parent;
+      const tg = this.data.target.object3D, parent = tg.parent;
       const target = parent.worldToLocal(this.tmp.copy(ray.direction).multiplyScalar(this.dist).add(ray.origin));
-      // keep the panel facing the viewer as it moves
-      const camEl = this.el.sceneEl.camera.el;
-      camEl.object3D.getWorldPosition(this.cam); parent.worldToLocal(this.cam);
-      panel.rotation.y = Math.atan2(this.cam.x - target.x, this.cam.z - target.z);
-      panel.position.copy(target);
-      panel.updateMatrix();
-      const off = this.offset.clone().applyQuaternion(panel.quaternion);
-      panel.position.sub(off);
+      this.el.sceneEl.camera.getWorldPosition(this.cam); parent.worldToLocal(this.cam);
+      tg.rotation.y = Math.atan2(this.cam.x - target.x, this.cam.z - target.z);   // keep facing the viewer
+      tg.position.copy(target);
+      tg.updateMatrix();
+      tg.position.sub(this.offset.clone().applyQuaternion(tg.quaternion));
     }
+    if (!this.data.label) return;
     const key = this.hover + '' + this.dragging;
     if (key === this.drawn) return;
     this.drawn = key;
@@ -680,8 +919,90 @@ AFRAME.registerComponent('panel-grab', {
     c.clearRect(0, 0, 768, 80);
     c.fillStyle = on ? '#3a86b8' : '#22324a'; roundRect(c, 4, 4, 760, 72, 36); c.fill();
     c.fillStyle = COL.text; c.font = `600 32px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
-    c.fillText(this.dragging ? 'Moving… release to place' : '✥  Grab here to move panel', 384, 42);
+    c.fillText(this.dragging ? 'Moving… release to place' : '✥  ' + this.data.label, 384, 42);
     this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Explainer text panel ----------
+function wrapLines(ctx, text, maxW) {
+  const words = text.split(' '), lines = []; let line = '';
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = w; } else line = test;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+AFRAME.registerComponent('explain-display', {
+  init: function () {
+    this.c = makeCanvasPlane(1.24, 1024, 520);
+    this.el.object3D.add(this.c.mesh);
+    this.last = 0; this.drawnKey = '';
+  },
+  tick: function (t) {
+    if (SIM.mode !== 'explain' || t - this.last < 100) return;
+    this.last = t;
+    const st = STEPS[SIM.step], f = SIM.f, c = this.c.ctx;
+    c.clearRect(0, 0, 1024, 520);
+    c.fillStyle = COL.panel; roundRect(c, 0, 0, 1024, 520, 28); c.fill();
+    c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+    // progress dots
+    for (let i = 0; i < STEPS.length; i++) {
+      c.fillStyle = i === SIM.step ? '#ffd166' : i < SIM.step ? '#4aa3df' : '#2b3a4f';
+      c.beginPath(); c.arc(44 + i * 30, 44, 9, 0, 2 * Math.PI); c.fill();
+    }
+    c.fillStyle = COL.muted; c.font = `600 24px ${FONT}`;
+    c.fillText(`STEP ${SIM.step + 1} OF ${STEPS.length}`, 44 + STEPS.length * 30 + 16, 53);
+    c.fillStyle = COL.text; c.font = `700 50px ${FONT}`; c.fillText(st.title, 40, 124);
+    c.font = `31px ${FONT}`; c.fillStyle = '#d5deea';
+    const lines = wrapLines(c, st.text, 944);
+    lines.forEach((ln, k) => c.fillText(ln, 40, 178 + k * 42));
+    let y = 178 + lines.length * 42 + 8;
+    if (SIM.showEq) {
+      c.fillStyle = '#16233a'; roundRect(c, 32, y - 6, 960, 60, 14); c.fill();
+      c.fillStyle = '#ffd166'; c.font = `600 29px ${FONT}`; c.fillText(st.eq, 52, y + 34);
+      y += 70;
+    }
+    if (st.view.showTemp) {
+      const Tc = SIM.Ts - 273.15, imb = f.imbalance, bal = Math.abs(imb) < 0.05;
+      c.font = `700 34px ${FONT}`; c.fillStyle = tempColor(Tc);
+      c.fillText(`Surface: ${Tc.toFixed(1)} °C`, 40, 500);
+      c.fillStyle = bal ? '#7ee0a0' : imb > 0 ? '#ff8a6b' : '#7cc4ff'; c.textAlign = 'right';
+      c.fillText(bal ? 'In balance' : `${imb > 0 ? 'Gaining' : 'Losing'} ${Math.abs(imb).toFixed(1)} W/m²`, 984, 500);
+    }
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Step title floating above the planet in explainer mode ----------
+AFRAME.registerComponent('explain-title', {
+  init: function () {
+    this.c = makeCanvasPlane(1.6, 1024, 110); this.el.object3D.add(this.c.mesh); this.shown = -1;
+    this.cam = new THREE.Vector3(); this.me = new THREE.Vector3();
+  },
+  tick: function () {
+    const o = this.el.object3D;
+    o.visible = SIM.mode === 'explain';
+    if (!o.visible) { this.shown = -1; return; }
+    if (this.shown !== SIM.step) {
+      this.shown = SIM.step;
+      const c = this.c.ctx; c.clearRect(0, 0, 1024, 110);
+      c.textAlign = 'center'; c.textBaseline = 'middle'; c.shadowColor = 'rgba(0,0,0,0.9)'; c.shadowBlur = 12;
+      c.fillStyle = '#ffffff'; c.font = `700 60px ${FONT}`;
+      c.fillText(`${SIM.step + 1}. ${STEPS[SIM.step].title}`, 512, 58);
+      this.c.tex.needsUpdate = true;
+    }
+  }
+});
+
+// ---------- Scene background changes in explainer mode ----------
+AFRAME.registerComponent('mode-manager', {
+  tick: function () {
+    if (this.mode === SIM.mode) return;
+    this.mode = SIM.mode;
+    this.el.setAttribute('background', 'color', SIM.mode === 'explain' ? '#0b1430' : '#03050a');
   }
 });
 
@@ -704,7 +1025,6 @@ AFRAME.registerComponent('auto-height', {
 AFRAME.registerComponent('ui-button', {
   schema: { action: { type: 'string' }, width: { type: 'number', default: 0.27 } },
   init: function () {
-    this.el.classList.add('clickable');
     this.c = makeCanvasPlane(this.data.width, 512, 124);
     const grp = new THREE.Group(); grp.add(this.c.mesh);
     this.el.setObject3D('ui', grp);
@@ -717,7 +1037,13 @@ AFRAME.registerComponent('ui-button', {
         case 'atmosphere': setAtmosphere(!p.atmosphere); break;
         case 'ice': p.iceFeedback = !p.iceFeedback; break;
         case 'pause': p.paused = !p.paused; break;
-        case 'reset': resetSim(); break;
+        case 'reset': resetSim(); this.el.sceneEl.emit('reset-poses'); break;
+        case 'arrows': SIM.showArrows = !SIM.showArrows; break;
+        case 'explain': copyPose('#panel', '#explainer'); enterExplainer(); break;
+        case 'prev': applyStep(SIM.step - 1); break;
+        case 'next': if (SIM.step < STEPS.length - 1) applyStep(SIM.step + 1); else { copyPose('#explainer', '#panel'); exitExplainer(); } break;
+        case 'eq': SIM.showEq = !SIM.showEq; break;
+        case 'exit': copyPose('#explainer', '#panel'); exitExplainer(); break;
       }
     });
   },
@@ -727,10 +1053,20 @@ AFRAME.registerComponent('ui-button', {
       case 'atmosphere': return [`Atmosphere: ${p.atmosphere ? 'ON' : 'OFF'}`, p.atmosphere];
       case 'ice': return [`Ice–albedo feedback: ${p.iceFeedback ? 'ON' : 'OFF'}`, p.iceFeedback];
       case 'pause': return [p.paused ? '▶  Resume' : '❚❚  Pause', p.paused];
-      default: return ['↺  Reset to present Earth', false];
+      case 'arrows': return [`Budget arrows: ${SIM.showArrows ? 'ON' : 'OFF'}`, SIM.showArrows];
+      case 'explain': return ['Explain step by step  ▶', true];
+      case 'prev': return ['◀  Back', false];
+      case 'next': return [SIM.step < STEPS.length - 1 ? 'Next  ▶' : 'Finish  ✓', true];
+      case 'eq': return [SIM.showEq ? 'Hide equations' : 'Show equations', SIM.showEq];
+      case 'exit': return ['✕  Exit explainer', false];
+      default: return ['↺  Reset everything', false];
     }
   },
   tick: function () {
+    let on = panelActive(this.el);
+    if (this.data.action === 'prev') on = on && SIM.step > 0;
+    setClickable(this.el, on);
+    this.el.object3D.visible = this.data.action !== 'prev' || SIM.step > 0;
     const [label, active] = this.state();
     const key = label + active + this.hover;
     if (key === this.drawn) return;
@@ -751,16 +1087,16 @@ AFRAME.registerComponent('ui-button', {
   <body>
     <!--
       PLANETARY ENERGY BALANCE in VR
-      Desktop: drag to look around, WASD to move, click and drag the sliders.
-      Quest: open in the browser, press the VR button, and point at the panel with
-      either controller; hold the trigger to drag a slider, click to press a button.
+      Desktop: drag to look around, WASD to move, click and drag sliders, handles and the Earth.
+      Quest: open in the browser, press the VR button, point with either controller and
+      hold the trigger to drag sliders, panels or the Earth; click the trigger for buttons.
     -->
     <a-scene background="color: #03050a"
              light="defaultLightsEnabled: false"
              renderer="antialias: true; colorManagement: true"
              cursor="rayOrigin: mouse; fuse: false"
              raycaster="objects: .clickable; far: 20"
-             sim-runner star-field auto-height="target: #stage">
+             sim-runner star-field mode-manager auto-height="target: #stage">
 
       <a-entity light="type: ambient; color: #9fb4d0; intensity: 0.3"></a-entity>
 
@@ -773,49 +1109,71 @@ AFRAME.registerComponent('ui-button', {
       <!-- Everything in #stage is shifted up or down in VR to match your eye height -->
       <a-entity id="stage">
 
-      <!-- Earth, Sun, atmosphere and flux particles -->
-      <a-entity planet-system position="0 1.85 -2.6"></a-entity>
+        <!-- The planet system: point at the Earth and hold the trigger to move all of it -->
+        <a-entity id="system" position="0 1.85 -2.6">
+          <a-entity planet-system grab-move="target: #system"></a-entity>
 
-      <!-- Labels in the scene -->
-      <a-entity world-label="text: Sunlight is intercepted by a disc of area πR²; color: #ffe066; width: 1.3"
-                position="-1.45 2.45 -2.6"></a-entity>
-      <a-entity world-label="text: Reflected sunlight; color: #fff4cc; width: 0.7"
-                position="-1.3 1.25 -2.4"></a-entity>
-      <a-entity world-label="text: Infrared leaves from the whole sphere, area 4πR²; color: #ff7a33; width: 1.4"
-                position="0 2.85 -2.6"></a-entity>
-      <a-entity world-label="text: Atmosphere absorbs infrared and re-emits it up and down; color: #8cc8ff; width: 1.0; showIf: atmosphere"
-                position="1.35 1.9 -2.4"></a-entity>
+          <a-entity world-label="text: Sunlight is intercepted by a disc of area πR²; color: #ffe066; width: 1.3"
+                    position="-1.45 0.65 0"></a-entity>
+          <a-entity world-label="text: Reflected sunlight; color: #fff4cc; width: 0.7"
+                    position="-1.35 -1.0 0.3"></a-entity>
+          <a-entity world-label="text: Infrared leaves from the whole sphere, area 4πR²; color: #ff7a33; width: 1.4"
+                    position="0 1.1 0"></a-entity>
+          <a-entity world-label="text: Atmosphere absorbs infrared and re-emits it up and down; color: #8cc8ff; width: 1.0; showIf: atmosphere"
+                    position="1.5 0.05 0.2"></a-entity>
 
-      <!-- Control panel -->
-      <a-entity id="panel" position="0.6 1.0 -1.3" rotation="-35 -28 0">
-        <a-entity panel-grab="target: #panel; width: 0.6" position="0 0.37 0.002"></a-entity>
-        <a-plane width="1.46" height="0.66" position="0 0 -0.004" material="shader: flat; color: #2a3b55"></a-plane>
-        <a-plane width="1.44" height="0.64" position="0 0 -0.002" material="shader: flat; color: #0b1320"></a-plane>
+          <a-entity explain-title position="0 1.15 0"></a-entity>
+        </a-entity>
 
-        <a-entity info-display position="-0.33 0 0.001"></a-entity>
+        <!-- Main control panel -->
+        <a-entity id="panel" mode-visible="mode: main" position="0.6 1.0 -1.3" rotation="-35 -28 0">
+          <a-entity grab-move="target: #panel; label: Grab here to move panel; width: 0.6" position="0 0.38 0.002"></a-entity>
+          <a-plane width="1.46" height="0.78" position="0 -0.05 -0.004" material="shader: flat; color: #2a3b55"></a-plane>
+          <a-plane width="1.44" height="0.76" position="0 -0.05 -0.002" material="shader: flat; color: #0b1320"></a-plane>
 
-        <a-entity ui-slider="key: S0; min: 800; max: 2000; step: 1; decimals: 0; label: Solar constant S₀; unit: W/m²"
-                  position="0.36 0.245 0.002"></a-entity>
-        <a-entity ui-slider="key: albedo; min: 0; max: 0.9; step: 0.01; decimals: 2; label: Albedo α"
-                  position="0.36 0.15 0.002"></a-entity>
-        <a-entity ui-slider="key: eps; min: 0; max: 1; step: 0.01; decimals: 2; label: Greenhouse emissivity ε; enabledIf: atmosphere"
-                  position="0.36 0.055 0.002"></a-entity>
-        <a-entity ui-slider="key: speed; min: 0.1; max: 5; step: 0.1; decimals: 1; label: Simulation speed; unit: yr/s"
-                  position="0.36 -0.04 0.002"></a-entity>
+          <a-entity info-display position="-0.33 0 0.001"></a-entity>
 
-        <a-entity ui-button="action: atmosphere" position="0.215 -0.135 0.002"></a-entity>
-        <a-entity ui-button="action: ice" position="0.505 -0.135 0.002"></a-entity>
-        <a-entity ui-button="action: pause" position="0.215 -0.225 0.002"></a-entity>
-        <a-entity ui-button="action: reset" position="0.505 -0.225 0.002"></a-entity>
-      </a-entity>
+          <a-entity ui-slider="key: S0; min: 800; max: 2000; step: 1; decimals: 0; label: Solar constant S₀; unit: W/m²"
+                    position="0.36 0.245 0.002"></a-entity>
+          <a-entity ui-slider="key: albedo; min: 0; max: 0.9; step: 0.01; decimals: 2; label: Albedo α"
+                    position="0.36 0.15 0.002"></a-entity>
+          <a-entity ui-slider="key: eps; min: 0; max: 1; step: 0.01; decimals: 2; label: Greenhouse emissivity ε; enabledIf: atmosphere"
+                    position="0.36 0.055 0.002"></a-entity>
+          <a-entity ui-slider="key: speed; min: 0.1; max: 5; step: 0.1; decimals: 1; label: Simulation speed; unit: yr/s"
+                    position="0.36 -0.04 0.002"></a-entity>
+
+          <a-entity ui-button="action: atmosphere" position="0.215 -0.135 0.002"></a-entity>
+          <a-entity ui-button="action: ice" position="0.505 -0.135 0.002"></a-entity>
+          <a-entity ui-button="action: arrows" position="0.215 -0.225 0.002"></a-entity>
+          <a-entity ui-button="action: pause" position="0.505 -0.225 0.002"></a-entity>
+          <a-entity ui-button="action: explain" position="0.215 -0.315 0.002"></a-entity>
+          <a-entity ui-button="action: reset" position="0.505 -0.315 0.002"></a-entity>
+        </a-entity>
+
+        <!-- Explainer panel (shown only in explainer mode) -->
+        <a-entity id="explainer" mode-visible="mode: explain" position="0.6 0.95 -1.3" rotation="-40 -28 0">
+          <a-entity grab-move="target: #explainer; label: Grab here to move panel; width: 0.6" position="0 0.48 0.002"></a-entity>
+          <a-plane width="1.32" height="0.92" position="0 -0.02 -0.004" material="shader: flat; color: #2a3b55"></a-plane>
+          <a-plane width="1.30" height="0.90" position="0 -0.02 -0.002" material="shader: flat; color: #0b1320"></a-plane>
+
+          <a-entity explain-display position="0 0.1 0.001"></a-entity>
+
+          <a-entity ui-slider="dynamic: true; key: S0; min: 1000; max: 1700; label: Slider; width: 0.9"
+                    position="0 -0.29 0.002"></a-entity>
+
+          <a-entity ui-button="action: prev; width: 0.28" position="-0.45 -0.4 0.002"></a-entity>
+          <a-entity ui-button="action: next; width: 0.28" position="-0.15 -0.4 0.002"></a-entity>
+          <a-entity ui-button="action: eq; width: 0.28" position="0.15 -0.4 0.002"></a-entity>
+          <a-entity ui-button="action: exit; width: 0.28" position="0.45 -0.4 0.002"></a-entity>
+        </a-entity>
 
       </a-entity>
 
       <!-- Camera and Quest controllers (laser pointers) -->
       <a-entity id="rig">
         <a-entity camera look-controls wasd-controls position="0 1.6 0"></a-entity>
-        <a-entity laser-controls="hand: left" raycaster="objects: .clickable; far: 6; lineColor: #9fd3ff; lineOpacity: 0.7"></a-entity>
-        <a-entity laser-controls="hand: right" raycaster="objects: .clickable; far: 6; lineColor: #9fd3ff; lineOpacity: 0.7"></a-entity>
+        <a-entity laser-controls="hand: left" raycaster="objects: .clickable; far: 8; lineColor: #9fd3ff; lineOpacity: 0.7"></a-entity>
+        <a-entity laser-controls="hand: right" raycaster="objects: .clickable; far: 8; lineColor: #9fd3ff; lineOpacity: 0.7"></a-entity>
       </a-entity>
     </a-scene>
   </body>
