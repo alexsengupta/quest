@@ -1,0 +1,1860 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bushfire Spread (VR)</title>
+    <script src="https://aframe.io/releases/1.7.0/aframe.min.js"></script>
+    <script>
+// ===================== MODEL (no graphics) =====================
+// The land is a 128 x 128 grid of 20 m squares (2.56 km across).
+// For every square the model works out WHEN the fire arrives, using the fastest route from
+// any burning square (a "minimum travel time" method, like Dijkstra's shortest-path algorithm).
+// Each step between neighbouring squares takes   distance / rate of spread,   where
+//   rate of spread R = R0(fuel) x moisture factor x wind factor(direction) x slope factor
+//   wind:  head-fire speed rises as exp(0.05 U)  (U in km/h) and the fire grows as an ellipse
+//          with length/breadth = 1 + 0.0012 U^2.154  (Alexander 1985), ignition at the rear focus
+//   slope: McArthur's rule of thumb, speed doubles for every 10 degrees upslope: exp(0.069 * slope)
+//   moisture: exp(-0.11 (M - 6)), no spread at all above 25% moisture
+// Using 16 neighbours (including "knight's moves") avoids the octagon-shaped fires a simple grid gives.
+const N = 128, DX = 20, L = N * DX;          // cells per side, cell size (m), domain width (m)
+const HALF = (N - 1) / 2 * DX;               // distance from the centre to the outermost cell centres
+const NONE = 0, GRASS = 1, FOREST = 2;
+const FUELS = [
+  // R0: spread rate on flat ground, no wind, 6% moisture (m/min); flame / smoulder: how long a square
+  // burns (min, lengthened a little so the burning band is visible); flameH: flame height (m) at R0
+  { name: 'Bare ground', R0: 0,   flame: 0, smoulder: 0,  flameH: 0,   embers: 0 },
+  { name: 'Grass',       R0: 6.7, flame: 2, smoulder: 5,  flameH: 2.5, embers: 0.12 },
+  { name: 'Forest',      R0: 3.3, flame: 8, smoulder: 45, flameH: 11,  embers: 1 }
+];
+const TERRAINS = [['hills', 'Rolling hills'], ['hill', 'Single hill'], ['ridges', 'Ridges'],
+                  ['valley', 'Valley'], ['flat', 'Flat plain']];
+const FUELMAPS = [['mixed', 'Grass + forest'], ['grass', 'All grass'], ['forest', 'All forest']];
+
+const DEFAULTS = { windSpeed: 25, windDir: 315, moisture: 6, speed: 3, slope: true, spotting: false,
+                   timeMap: false, night: false, streaks: true, paused: false };
+
+const SIM = {
+  params: Object.assign({}, DEFAULTS),
+  terrain: 'hills', fuelMap: 'mixed',
+  h: new Float32Array(N * N),        // ground height (m)
+  fuel: new Uint8Array(N * N),       // NONE / GRASS / FOREST
+  state: new Uint8Array(N * N),      // 0 unburnt, 1 burning or smouldering, 2 burnt out
+  tIgn: new Float32Array(N * N),     // time the fire arrived (min)
+  ros: new Float32Array(N * N),      // rate of spread with which it arrived (m/min): sets flame size
+  tTent: new Float64Array(N * N),    // provisional arrival times for unburnt squares
+  rTent: new Float32Array(N * N),
+  active: [], embers: [], flashes: [],
+  now: 0, t0: 0, started: false, burnt: 0, spots: 0,
+  dirty: false, lastRebuild: 0, last: {}, windChange: null,
+  terrainVer: 0, fuelVer: 0, P: null
+};
+
+function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+// Smooth value noise for building landscapes
+function makeNoise(seed) {
+  const r = mulberry32(seed), P = 256, g = new Float32Array(P * P);
+  for (let i = 0; i < P * P; i++) g[i] = r();
+  const s = (t) => t * t * (3 - 2 * t);
+  return function (x, y) {
+    const xi = Math.floor(x), yi = Math.floor(y), fx = s(x - xi), fy = s(y - yi);
+    const a = (xi & 255) + (yi & 255) * P, b = ((xi + 1) & 255) + (yi & 255) * P;
+    const c = (xi & 255) + ((yi + 1) & 255) * P, d = ((xi + 1) & 255) + ((yi + 1) & 255) * P;
+    return (g[a] * (1 - fx) + g[b] * fx) * (1 - fy) + (g[c] * (1 - fx) + g[d] * fx) * fy;
+  };
+}
+function fbm(nz, x, y, oct) {
+  let v = 0, amp = 0.5, tot = 0;
+  for (let o = 0; o < oct; o++) { v += amp * nz(x, y); tot += amp; x *= 2.03; y *= 2.03; amp *= 0.5; }
+  return v / tot;
+}
+const cellX = (i) => i * DX - HALF;
+const cellIdx = (x, z) => {
+  const i = Math.round((x + HALF) / DX), j = Math.round((z + HALF) / DX);
+  return (i < 0 || j < 0 || i >= N || j >= N) ? -1 : j * N + i;
+};
+
+function genTerrain(kind) {
+  const nz = makeNoise(11), h = SIM.h;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const x = cellX(i), z = cellX(j), n = fbm(nz, x / 700 + 20, z / 700 + 20, 4);
+    let v;
+    switch (kind) {
+      case 'flat': v = 20; break;
+      case 'hill': v = 20 + 250 * Math.exp(-(x * x + z * z) / (2 * 420 * 420)) + 8 * n; break;
+      case 'ridges': v = 110 + 75 * Math.sin(2 * Math.PI * (x + 120 * Math.sin(2 * Math.PI * z / 2000)) / 1150) + 30 * (n - 0.5); break;
+      case 'valley': v = 25 + 330 * Math.pow(Math.abs(z + 90 * Math.sin(2 * Math.PI * x / 1600)) / 1280, 1.5) + 40 * (n - 0.5); break;
+      default: { const m = fbm(nz, x / 1500 + 7, z / 1500 + 7, 3), u = clamp((m - 0.25) / 0.55, 0, 1); v = 15 + 230 * u * u * (3 - 2 * u); }
+    }
+    h[j * N + i] = Math.max(0, v);
+  }
+  SIM.terrain = kind; SIM.terrainVer++; SIM.dirty = true;
+}
+
+function genFuel(kind) {
+  const nz = makeNoise(5), h = SIM.h;
+  let mean = 0; for (let c = 0; c < N * N; c++) mean += h[c]; mean /= N * N;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const c = j * N + i;
+    if (kind === 'grass') SIM.fuel[c] = GRASS;
+    else if (kind === 'forest') SIM.fuel[c] = FOREST;
+    else {
+      const n = fbm(nz, cellX(i) / 450 + 50, cellX(j) / 450 + 50, 3) + 0.0012 * (h[c] - mean);
+      SIM.fuel[c] = n > 0.53 ? FOREST : GRASS;
+    }
+  }
+  SIM.fuelMap = kind; SIM.fuelVer++; SIM.dirty = true;
+}
+
+// The 16 neighbour steps. Diagonal and knight's moves may not slip through gaps in a firebreak.
+const NB = [];
+for (let dj = -2; dj <= 2; dj++) for (let di = -2; di <= 2; di++) {
+  const a = Math.abs(di), b = Math.abs(dj);
+  if (!((Math.max(a, b) === 1) || (a + b === 3))) continue;
+  const len = Math.hypot(di, dj), nb = { di, dj, d: DX * len, ux: di / len, uz: dj / len, via: null, both: false };
+  if (a === 1 && b === 1) nb.via = [[di, 0], [0, dj]];
+  else if (a === 2) { nb.via = [[di / 2, 0], [di / 2, dj]]; nb.both = true; }
+  else if (b === 2) { nb.via = [[0, dj / 2], [di, dj / 2]]; nb.both = true; }
+  NB.push(nb);
+}
+
+// A min-heap of (time, cell) pairs; out-of-date entries are skipped when popped
+const HEAP = {
+  k: new Float64Array(4096), v: new Int32Array(4096), n: 0,
+  clear() { this.n = 0; },
+  push(key, val) {
+    if (this.n === this.k.length) {
+      const k2 = new Float64Array(this.n * 2), v2 = new Int32Array(this.n * 2);
+      k2.set(this.k); v2.set(this.v); this.k = k2; this.v = v2;
+    }
+    let i = this.n++;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.k[p] <= key) break;
+      this.k[i] = this.k[p]; this.v[i] = this.v[p]; i = p;
+    }
+    this.k[i] = key; this.v[i] = val;
+  },
+  pop() {
+    const top = this.v[0]; this.topKey = this.k[0];
+    const key = this.k[--this.n], val = this.v[this.n];
+    let i = 0;
+    for (;;) {
+      let c = 2 * i + 1;
+      if (c >= this.n) break;
+      if (c + 1 < this.n && this.k[c + 1] < this.k[c]) c++;
+      if (this.k[c] >= key) break;
+      this.k[i] = this.k[c]; this.v[i] = this.v[c]; i = c;
+    }
+    this.k[i] = key; this.v[i] = val;
+    return top;
+  }
+};
+
+function moistureFactor(M) { return M >= 25 ? 0 : Math.exp(-0.11 * (M - 6)) * Math.min(1, (25 - M) / 5); }
+function windToward() {   // unit vector the wind blows TOWARDS (x east, z south); windDir is where it comes FROM
+  const th = SIM.params.windDir * Math.PI / 180;
+  return [-Math.sin(th), Math.cos(th)];
+}
+function lengthToBreadth(U) { return Math.min(8, 1 + 0.0012 * Math.pow(U, 2.154)); }
+function updateP() {
+  const U = SIM.params.windSpeed, LB = lengthToBreadth(U), w = windToward();
+  SIM.P = { head: Math.exp(0.05 * U), e: Math.sqrt(1 - 1 / (LB * LB)), wx: w[0], wz: w[1],
+            moist: moistureFactor(SIM.params.moisture), slope: SIM.params.slope };
+}
+// Rate of spread (m/min) for fire moving from square a to its neighbour b along stencil step k
+function spreadRate(a, b, nb) {
+  const f = SIM.fuel[b], P = SIM.P;
+  let R = FUELS[f].R0 * P.moist;
+  if (R <= 0) return 0;
+  R *= P.head * (1 - P.e) / (1 - P.e * (nb.ux * P.wx + nb.uz * P.wz));
+  if (P.slope) {
+    const deg = Math.atan((SIM.h[b] - SIM.h[a]) / nb.d) * 57.29578;
+    R *= clamp(Math.exp(0.069 * deg), 0.3, 6);   // capped near 26 degrees
+  }
+  return R;
+}
+function relaxFrom(c, t0, tMin) {
+  const ci = c % N, cj = (c / N) | 0, fuel = SIM.fuel;
+  for (let k = 0; k < NB.length; k++) {
+    const nb = NB[k], i = ci + nb.di, j = cj + nb.dj;
+    if (i < 0 || j < 0 || i >= N || j >= N) continue;
+    const b = j * N + i;
+    if (SIM.state[b] !== 0 || !fuel[b]) continue;
+    if (nb.via) {
+      const f1 = fuel[(cj + nb.via[0][1]) * N + ci + nb.via[0][0]] > 0;
+      const f2 = fuel[(cj + nb.via[1][1]) * N + ci + nb.via[1][0]] > 0;
+      if (nb.both ? !(f1 && f2) : !(f1 || f2)) continue;
+    }
+    const R = spreadRate(c, b, nb);
+    if (R <= 0) continue;
+    const t = Math.max(tMin, t0 + nb.d / R);
+    if (t < SIM.tTent[b]) { SIM.tTent[b] = t; SIM.rTent[b] = R; HEAP.push(t, b); }
+  }
+}
+function igniteCell(c, t, R) {
+  if (SIM.state[c] !== 0 || !SIM.fuel[c]) return false;
+  SIM.state[c] = 1; SIM.tIgn[c] = t; SIM.ros[c] = R;
+  SIM.active.push(c); SIM.burnt++;
+  relaxFrom(c, t, t);
+  return true;
+}
+// After wind, moisture, slope, terrain or fuel changes, recompute the provisional arrival times
+function rebuildFront() {
+  updateP();
+  HEAP.clear();
+  for (let c = 0; c < N * N; c++) if (SIM.state[c] === 0) SIM.tTent[c] = Infinity;
+  for (let c = 0; c < N * N; c++) if (SIM.state[c] !== 0) relaxFrom(c, SIM.tIgn[c], SIM.now);
+  SIM.dirty = false;
+}
+
+// Start a fire at model position (x, z) metres. Returns false if there is nothing there to burn.
+function startFire(x, z) {
+  const c = cellIdx(x, z);
+  if (c < 0 || !SIM.fuel[c] || SIM.state[c] !== 0) return false;
+  updateP();
+  if (P_tooWet()) return false;
+  if (!SIM.started) { SIM.started = true; SIM.t0 = SIM.now; }
+  igniteCell(c, SIM.now, FUELS[SIM.fuel[c]].R0 * SIM.P.moist);
+  SIM.flashes.push({ c, spot: false, age: 0 });
+  return true;
+}
+function P_tooWet() { return SIM.P.moist <= 0; }
+
+function resetFire() {
+  SIM.state.fill(0); SIM.tIgn.fill(Infinity); SIM.tTent.fill(Infinity); SIM.ros.fill(0);
+  HEAP.clear();
+  SIM.active = []; SIM.embers = []; SIM.flashes = [];
+  SIM.now = 0; SIM.t0 = 0; SIM.started = false; SIM.burnt = 0; SIM.spots = 0;
+  SIM.windChange = null; SIM.params.paused = false;
+  updateP();
+}
+
+// Terrain and fuel editing
+function sculpt(x, z, radius, amount) {
+  const s2 = 2 * (radius / 2) * (radius / 2), r = Math.ceil(radius / DX);
+  const ic = Math.round((x + HALF) / DX), jc = Math.round((z + HALF) / DX);
+  for (let j = jc - r; j <= jc + r; j++) for (let i = ic - r; i <= ic + r; i++) {
+    if (i < 0 || j < 0 || i >= N || j >= N) continue;
+    const dx = cellX(i) - x, dz = cellX(j) - z, c = j * N + i;
+    SIM.h[c] = clamp(SIM.h[c] + amount * Math.exp(-(dx * dx + dz * dz) / s2), 0, 650);
+  }
+  SIM.terrainVer++; SIM.dirty = true;
+}
+function paintFuel(x, z, radius, f) {
+  const r = Math.ceil(radius / DX), ic = Math.round((x + HALF) / DX), jc = Math.round((z + HALF) / DX);
+  let changed = false;
+  for (let j = jc - r; j <= jc + r; j++) for (let i = ic - r; i <= ic + r; i++) {
+    if (i < 0 || j < 0 || i >= N || j >= N) continue;
+    const dx = cellX(i) - x, dz = cellX(j) - z, c = j * N + i;
+    if (dx * dx + dz * dz > radius * radius || SIM.state[c] !== 0 || SIM.fuel[c] === f) continue;
+    SIM.fuel[c] = f; changed = true;
+  }
+  if (changed) { SIM.fuelVer++; SIM.dirty = true; }
+}
+
+function heightAt(x, z) {
+  const gx = clamp((x + HALF) / DX, 0, N - 1.001), gz = clamp((z + HALF) / DX, 0, N - 1.001);
+  const i = Math.floor(gx), j = Math.floor(gz), fx = gx - i, fz = gz - j, h = SIM.h, c = j * N + i;
+  return (h[c] * (1 - fx) + h[c + 1] * fx) * (1 - fz) + (h[c + N] * (1 - fx) + h[c + N + 1] * fx) * fz;
+}
+
+// Embers: launched from flaming squares, carried downwind, and may start spot fires where they land
+let emberRnd = mulberry32(99);
+function gauss() { return Math.sqrt(-2 * Math.log(emberRnd() + 1e-9)) * Math.cos(2 * Math.PI * emberRnd()); }
+function launchEmbers(dtSim) {
+  const p = SIM.params, U = p.windSpeed;
+  if (!p.spotting || U < 5 || SIM.embers.length > 160) return;
+  const rate = 0.003 * Math.pow(U / 30, 1.5);          // embers per minute from one flaming forest square
+  const [wx, wz] = windToward();
+  for (const c of SIM.active) {
+    const f = SIM.fuel[c], age = SIM.now - SIM.tIgn[c];
+    if (age > FUELS[f].flame) continue;
+    if (emberRnd() > rate * FUELS[f].embers * dtSim) continue;
+    const dist = Math.min(3000, (40 + 12 * U) * -Math.log(emberRnd() + 1e-9));
+    const lat = gauss() * 0.25 * dist;
+    const x0 = cellX(c % N), z0 = cellX((c / N) | 0);
+    SIM.embers.push({ x0, z0, h0: SIM.h[c], x1: x0 + wx * dist - wz * lat, z1: z0 + wz * dist + wx * lat,
+                      dist, age: 0, dur: 1.2 + dist / 700 });
+  }
+}
+function flyEmbers(dtReal) {
+  for (let k = SIM.embers.length - 1; k >= 0; k--) {
+    const e = SIM.embers[k];
+    e.age += dtReal;
+    if (e.age < e.dur) continue;
+    SIM.embers.splice(k, 1);
+    const c = cellIdx(e.x1, e.z1);
+    if (c < 0 || SIM.state[c] !== 0 || !SIM.fuel[c]) continue;
+    const pIgnite = 0.3 * Math.min(1, SIM.P.moist) * (SIM.fuel[c] === FOREST ? 1 : 0.7);
+    if (emberRnd() < pIgnite && igniteCell(c, SIM.now, FUELS[SIM.fuel[c]].R0 * SIM.P.moist)) {
+      SIM.spots++; SIM.flashes.push({ c, spot: true, age: 0 });
+    }
+  }
+}
+
+// Advance the model by dtReal seconds of real time
+function stepModel(dtReal) {
+  const p = SIM.params;
+  for (let k = SIM.flashes.length - 1; k >= 0; k--) if ((SIM.flashes[k].age += dtReal) > 1.5) SIM.flashes.splice(k, 1);
+  if (p.paused) return;
+  // anything that changes spread rates triggers a (throttled) recalculation of the front
+  const key = p.windSpeed + '|' + p.windDir + '|' + p.moisture + '|' + p.slope;
+  if (key !== SIM.last.key) { SIM.last.key = key; SIM.dirty = true; }
+  if (!SIM.started) { if (SIM.dirty) updateP(); return; }
+  const dtSim = dtReal * p.speed;
+  // a scheduled wind change: the wind swings round over a few minutes
+  const wc = SIM.windChange;
+  if (wc && SIM.now - SIM.t0 >= wc.at) {
+    let d = ((wc.dir - p.windDir + 540) % 360) - 180;
+    const turn = 12 * dtSim;                               // degrees per minute
+    p.windDir = Math.abs(d) <= turn ? wc.dir : (p.windDir + Math.sign(d) * turn + 360) % 360;
+    if (wc.speed !== undefined) p.windSpeed += clamp(wc.speed - p.windSpeed, -2 * dtSim, 2 * dtSim);
+    if (p.windDir === wc.dir && (wc.speed === undefined || Math.abs(p.windSpeed - wc.speed) < 0.5)) {
+      p.windSpeed = wc.speed !== undefined ? wc.speed : p.windSpeed; SIM.windChange = null;
+    }
+    p.windDir = Math.round(p.windDir * 10) / 10; p.windSpeed = Math.round(p.windSpeed * 10) / 10;
+  }
+  const t = performance.now();
+  if (SIM.dirty && t - SIM.lastRebuild > 150) { rebuildFront(); SIM.lastRebuild = t; }
+  if (!SIM.P) updateP();
+  SIM.now += dtSim;
+  while (HEAP.n && HEAP.k[0] <= SIM.now) {
+    const c = HEAP.pop(), key2 = HEAP.topKey;
+    if (SIM.state[c] !== 0 || key2 !== SIM.tTent[c]) continue;
+    igniteCell(c, key2, SIM.rTent[c]);
+  }
+  // squares that have finished smouldering are burnt out
+  const act = SIM.active;
+  for (let k = act.length - 1; k >= 0; k--) {
+    const c = act[k], F = FUELS[SIM.fuel[c]];
+    if (SIM.now - SIM.tIgn[c] > F.flame + F.smoulder) { SIM.state[c] = 2; act[k] = act[act.length - 1]; act.pop(); }
+  }
+  launchEmbers(dtSim);
+  flyEmbers(dtReal);
+}
+
+// Summary numbers for the panels
+function stats() {
+  let head = 0, flaming = 0;
+  for (const c of SIM.active) {
+    const age = SIM.now - SIM.tIgn[c];
+    if (age < FUELS[SIM.fuel[c]].flame) flaming++;
+    if (age < 3 && SIM.ros[c] > head) head = SIM.ros[c];
+  }
+  return { elapsed: SIM.started ? SIM.now - SIM.t0 : 0, areaHa: SIM.burnt * DX * DX / 1e4,
+           headKmh: head * 0.06, flaming, spots: SIM.spots };
+}
+function compassName(deg) {
+  const names = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+  return names[Math.round(((deg % 360) + 360) % 360 / 22.5) % 16];
+}
+function fmtTime(min) {
+  const m = Math.floor(min), h = Math.floor(m / 60);
+  return h > 0 ? `${h} h ${String(m % 60).padStart(2, '0')} min` : `${m} min`;
+}
+
+genTerrain('hills'); genFuel('mixed'); resetFire();
+
+// ===================== VIEW STATE AND EXPLAINER STEPS =====================
+SIM.mode = 'main';          // 'main' or 'explain'
+SIM.step = 0;
+SIM.showEq = false;
+SIM.tool = 'ignite';
+SIM.view = { mode: 'table', yaw: 0, zoom: 1, panX: 0, panZ: 0, gx: 0, gz: 0, gyaw: 0 };
+SIM.pending = null;
+const TABLE = { x: 0, y: 0.72, z: -1.9, width: 2.0 };   // the tabletop map: 2 m across, centred 1.9 m ahead
+
+const STEPS = [
+  { title: 'How a fire spreads',
+    text: 'A fire spreads when heat from burning fuel dries out and ignites the fuel next to it. Here the land is flat, the grass is the same everywhere and there is no wind, so the fire grows at the same speed in every direction: a circle. Try making the grass wetter with the slider and watch the fire slow down (wetter grass also looks greener).',
+    eq: 'Time to cross each 20 m square  =  20 m ÷ rate of spread',
+    setup: { terrain: 'flat', fuel: 'grass' }, params: { windSpeed: 0, speed: 4 }, ignite: [[0, 0]],
+    slider: { key: 'moisture', min: 2, max: 25, step: 0.5, decimals: 1, label: 'Fuel moisture', unit: '%' } },
+  { title: 'Wind pushes the fire',
+    text: 'Wind tilts the flames forward over unburnt fuel and blows hot gases ahead, so the fire stretches into an egg shape. The fast front is the head fire. The sides (the flanks) move more slowly, and a backing fire creeps slowly into the wind. Change the wind speed and watch the shape change.',
+    eq: 'Head fire:  R = R₀ × e^(0.05 U)       Length ÷ width ≈ 1 + 0.0012 U^2.15     (U = wind in km/h)',
+    setup: { terrain: 'flat', fuel: 'grass' }, params: { windSpeed: 30, windDir: 270, speed: 2 }, ignite: [[-900, 0]],
+    slider: { key: 'windSpeed', min: 0, max: 60, step: 1, decimals: 0, label: 'Wind speed', unit: 'km/h' } },
+  { title: 'Fires run uphill',
+    text: 'On a slope the flames lean towards the fuel above them and pre-heat it, so fires race uphill and slow down going downhill. A rule of thumb from Australian research: every 10° of upward slope roughly doubles the speed. There is no wind here. Switch the slope effect off and replay to compare, or use "Stand here" to watch from the hilltop.',
+    eq: 'Slope factor  ≈  e^(0.069 θ)  ≈  2^(θ ÷ 10°)       (McArthur’s rule of thumb, θ = slope)',
+    setup: { terrain: 'hill', fuel: 'grass' }, params: { windSpeed: 0, speed: 3 }, ignite: [[0, 680]],
+    toggle: 'slope' },
+  { title: 'Fuel and firebreaks',
+    text: 'Grass fires spread fast but burn out within minutes. Forest fires burn for much longer, with far taller flames. Bare ground (light brown) has nothing to burn. The Firebreak tool is now selected on the tools panel: hold the trigger and sweep to clear a break in front of the fire, and see whether it holds.',
+    eq: 'Flat ground, no wind, 6% moisture:  grass ≈ 0.4 km/h,  forest ≈ 0.2 km/h.   Drier fuel burns faster.',
+    setup: { terrain: 'hills', fuel: 'mixed' }, params: { windSpeed: 20, windDir: 315, speed: 2 }, ignite: [[-900, -900]], tool: 'break',
+    slider: { key: 'moisture', min: 2, max: 25, step: 0.5, decimals: 1, label: 'Fuel moisture', unit: '%' } },
+  { title: 'Embers jump ahead',
+    text: 'Burning bark and leaves are lifted by the smoke plume and carried downwind. Where they land on dry fuel they start spot fires, often hundreds of metres ahead of the front, and in extreme fires tens of kilometres. Spotting lets fires jump roads, rivers and firebreaks. Raise the wind and watch more embers fly.',
+    eq: 'Spotting distance is random, averaging about  40 m + 12 m × U     (U = wind in km/h)',
+    setup: { terrain: 'hills', fuel: 'forest' }, params: { windSpeed: 45, windDir: 315, moisture: 4, spotting: true, speed: 3 }, ignite: [[-950, -950]],
+    slider: { key: 'windSpeed', min: 10, max: 70, step: 1, decimals: 0, label: 'Wind speed', unit: 'km/h' }, toggle: 'spotting' },
+  { title: 'The wind change',
+    text: 'In south-east Australia the worst fire days often bring a hot north-westerly wind followed by a cooler south-westerly change. Watch the fire stretch out towards the south-east, then the wind swings round: the long eastern flank suddenly becomes a head fire several times wider. This happened on Ash Wednesday (1983) and Black Saturday (2009).',
+    eq: 'Wind swings from the north-west (315°) to the south-west (225°)',
+    setup: { terrain: 'hills', fuel: 'grass' }, params: { windSpeed: 30, windDir: 315, speed: 2.5 }, ignite: [[-950, -950]],
+    windChange: { at: 22, dir: 225, speed: 30 } },
+  { title: 'Reading a fire map',
+    text: 'Each white line joins places the fire reached at the same time, here every 10 minutes, and the colours run from early (purple) to recent (yellow). Where the lines are far apart the fire moved fast; where they bunch up it was slow. Look for fast runs uphill and with the wind. Fire agencies use simulators that produce maps like this to forecast where a fire will go.',
+    eq: 'Gap between lines  =  rate of spread × 10 minutes',
+    setup: { terrain: 'ridges', fuel: 'mixed' }, params: { windSpeed: 25, windDir: 270, timeMap: true, speed: 4 }, ignite: [[-1050, 0]],
+    toggle: 'timeMap' },
+  { title: 'What this model leaves out',
+    text: 'Real fires are far more complicated. Here the fire never changes the wind, but big fires create their own winds and can even build thunderstorms (pyrocumulonimbus). Real winds flow around hills, fuels vary from metre to metre, and the numbers here are rough. Use it to see the main ideas, not as a forecast. Press Finish to explore freely.',
+    eq: 'This model:  rate of spread = fuel × moisture × wind × slope',
+    keep: true }
+];
+
+function applyStep(i) {
+  SIM.step = clamp(i, 0, STEPS.length - 1);
+  const st = STEPS[SIM.step];
+  if (st.keep) return;
+  genTerrain(st.setup.terrain); genFuel(st.setup.fuel);
+  resetFire();
+  Object.assign(SIM.params, DEFAULTS, st.params);
+  if (st.tool) SIM.tool = st.tool;
+  SIM.pending = { at: performance.now() + 800, pts: st.ignite, wc: st.windChange };
+}
+function enterExplainer() { SIM.mode = 'explain'; applyStep(0); }
+function exitExplainer() { SIM.mode = 'main'; SIM.pending = null; }
+
+// Fire centre (for facing the viewer towards it)
+function fireCentre() {
+  let x = 0, z = 0, n = 0;
+  for (const c of SIM.active) { x += cellX(c % N); z += cellX((c / N) | 0); n++; }
+  return n ? [x / n, z / n] : [0, 0];
+}
+function enterGround(x, z) {
+  const v = SIM.view;
+  v.gx = clamp(x, -HALF, HALF); v.gz = clamp(z, -HALF, HALF);
+  const [tx, tz] = fireCentre();
+  let dx = tx - v.gx, dz = tz - v.gz;
+  if (Math.hypot(dx, dz) < 60) { dx = 0; dz = -1; }
+  v.gyaw = Math.atan2(dx, -dz) + camYaw();
+  v.mode = 'ground';
+}
+function lookoutPoint() {
+  let best = 0;
+  for (let c = 0; c < N * N; c++) if (SIM.h[c] > SIM.h[best]) best = c;
+  return [cellX(best % N), cellX((best / N) | 0)];
+}
+
+// ===================== GRAPHICS AND INTERFACE =====================
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+const COL = { text: '#e8eef6', muted: '#8fa3bf', panel: '#0d1726', fire: '#ff8a3d', wind: '#9fd3ff' };
+
+// A flat plane carrying a 2D canvas, used for all text in the scene
+function makeCanvasPlane(widthM, pxW, pxH) {
+  const canvas = document.createElement('canvas');
+  canvas.width = pxW; canvas.height = pxH;
+  const ctx = canvas.getContext('2d');
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(widthM, widthM * pxH / pxW), mat);
+  return { canvas, ctx, tex, mesh, mat };
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h);
+}
+// A text label that always faces the viewer; call .setText() to change it
+function makeLabelSprite(text, color, widthM, px) {
+  const cv = document.createElement('canvas'); cv.width = 1024; cv.height = 112;
+  const c = cv.getContext('2d');
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true, depthTest: false, depthWrite: false }));
+  sp.scale.set(widthM, widthM * 112 / 1024, 1); sp.renderOrder = 20;
+  sp.setText = (s, col) => {
+    if (sp._txt === s + col) return; sp._txt = s + col;
+    c.clearRect(0, 0, 1024, 112);
+    c.font = `700 ${px || 60}px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.shadowColor = 'rgba(0,0,0,0.95)'; c.shadowBlur = 14; c.fillStyle = col || color;
+    c.fillText(s, 512, 58); t.needsUpdate = true;
+  };
+  sp.setText(text);
+  return sp;
+}
+function wrapLines(ctx, text, maxW) {
+  const words = text.split(' '), lines = []; let line = '';
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = w; } else line = test;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+// Colours (THREE.Color converts these sRGB hex codes to linear values for lighting)
+const lin = (hex) => new THREE.Color(hex);
+const C = { grassDry: lin('#c9a65a'), grassGreen: lin('#6c9a42'), forestFloor: lin('#4a5a2e'), bare: lin('#b09372'),
+            ashGrass: lin('#3b3733'), ashForest: lin('#222020'), char: lin('#151312'), crown: lin('#4d6b39'),
+            crownDry: lin('#6f7a3c'), trunk: lin('#3b2a1c') };
+const VIRIDIS = ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725'].map(lin);
+function ramp(cols, t, out) {
+  t = clamp(t, 0, 1) * (cols.length - 1);
+  const i = Math.min(cols.length - 2, Math.floor(t));
+  return out.copy(cols[i]).lerp(cols[i + 1], t - i);
+}
+
+// Uniforms shared by the terrain and the trees
+const UNI = {
+  uSun: { value: new THREE.Vector3(-0.45, 0.8, -0.4).normalize() },   // afternoon sun in the north-west
+  uLight: { value: 0.85 }, uAmb: { value: 0.38 }, uNow: { value: 0 }, uT0: { value: 0 },
+  uContour: { value: 10 }, uShowTime: { value: 0 }, uTopo: { value: 0.14 }, uSpeck: { value: 0 }
+};
+const HALFH = { value: 600 };   // half the viewport height in pixels, for particle sizes
+
+const TERRAIN_VS = `
+attribute vec3 albedo; attribute float glow; attribute float tarr;
+varying vec3 vAlb; varying float vGlow; varying float vT; varying vec3 vN; varying float vH; varying vec2 vXZ;
+void main() {
+  vXZ = position.xz;
+  vAlb = albedo; vGlow = glow; vT = tarr; vH = position.y;
+  vN = normalize(mat3(modelMatrix) * normal);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+const LIGHT_FS = `
+uniform vec3 uSun; uniform float uLight; uniform float uAmb;
+vec3 shade(vec3 alb, vec3 n, float glow) {
+  float dif = max(dot(normalize(n), uSun), 0.0);
+  vec3 c = alb * (uAmb + uLight * dif);
+  return c + vec3(1.0, 0.33, 0.05) * glow * 1.8 + vec3(1.0, 0.8, 0.35) * pow(glow, 3.0) * 1.4;
+}`;
+const TERRAIN_FS = LIGHT_FS + `
+uniform float uNow; uniform float uT0; uniform float uContour; uniform float uShowTime; uniform float uTopo; uniform float uSpeck;
+varying vec3 vAlb; varying float vGlow; varying float vT; varying vec3 vN; varying float vH; varying vec2 vXZ;
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+}
+float lineMask(float v, float px) {
+  float fw = max(fwidth(v), 1e-5);
+  return 1.0 - clamp(abs(fract(v - 0.5) - 0.5) / fw / px, 0.0, 1.0);
+}
+void main() {
+  vec3 alb = vAlb * (1.0 - uTopo * lineMask(vH / 50.0, 1.0));
+  // glowing ground is broken into patches of embers (only noticeable when standing in the landscape)
+  float n = 0.6 * vnoise(vXZ / 2.5) + 0.4 * vnoise(vXZ / 0.9);
+  float g = vGlow * mix(1.0, 0.1 + 2.2 * smoothstep(0.5, 0.85, n), uSpeck);
+  vec3 c = shade(alb, vN, g);
+  if (uShowTime > 0.5 && vT < uNow) c = mix(c, vec3(1.0), 0.85 * lineMask((vT - uT0) / uContour, 1.5));
+  gl_FragColor = vec4(c, 1.0);
+  #include <colorspace_fragment>
+}`;
+const TREE_VS = `
+attribute float part; attribute vec3 iCol; attribute float iGlow; attribute float iBurn;
+varying vec3 vAlb; varying float vGlow; varying vec3 vN;
+void main() {
+  vec3 p = position;
+  if (part > 0.5) p = mix(p, vec3(0.0, 0.52, 0.0), iBurn * 0.85);   // burnt crowns shrivel to bare trunks
+  vAlb = part > 0.5 ? iCol : mix(vec3(0.045, 0.025, 0.012), vec3(0.01), iBurn);
+  vGlow = part > 0.5 ? iGlow : iGlow * 0.5;
+  mat4 m = modelMatrix * instanceMatrix;
+  vN = mat3(m) * normal;
+  gl_Position = projectionMatrix * viewMatrix * m * vec4(p, 1.0);
+}`;
+const TREE_FS = LIGHT_FS + `
+varying vec3 vAlb; varying float vGlow; varying vec3 vN;
+void main() {
+  gl_FragColor = vec4(shade(vAlb, vN, vGlow), 1.0);
+  #include <colorspace_fragment>
+}`;
+const PT_VS = `
+attribute float aSize; attribute vec4 aCol;
+uniform float uScale; uniform float uHalfH; uniform float uMaxPx; uniform float uMinPx;
+varying vec4 vCol;
+void main() {
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  gl_Position = projectionMatrix * mv;
+  float dist = max(-mv.z, 0.01);
+  float px = aSize * uScale * projectionMatrix[1][1] * uHalfH / dist;
+  vCol = aCol;
+  vCol.a *= smoothstep(0.08, 0.45, dist);     // fade particles right in front of your eyes
+  gl_PointSize = clamp(px, uMinPx, uMaxPx);
+}`;
+const PT_FS = `
+uniform float uSoft; varying vec4 vCol;
+void main() {
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  float r2 = dot(q, q);
+  if (r2 > 1.0) discard;
+  float a = uSoft > 0.5 ? (1.0 - r2) * (1.0 - r2) : exp(-4.0 * r2);
+  gl_FragColor = vec4(vCol.rgb, vCol.a * a);
+  #include <colorspace_fragment>
+}`;
+
+// A pool of point particles (flames, smoke, sparks)
+class Particles {
+  constructor(max, o) {
+    this.max = max; this.n = 0; this.acc = 0; this.color = o.color; this.drag = o.drag || 0; this.grav = o.grav || 0;
+    this.p = new Float32Array(max * 3); this.v = new Float32Array(max * 3);
+    this.age = new Float32Array(max); this.life = new Float32Array(max);
+    this.s0 = new Float32Array(max); this.s1 = new Float32Array(max); this.k = new Float32Array(max);
+    const g = new THREE.BufferGeometry();
+    this.aPos = new THREE.BufferAttribute(new Float32Array(max * 3), 3).setUsage(THREE.DynamicDrawUsage);
+    this.aSize = new THREE.BufferAttribute(new Float32Array(max), 1).setUsage(THREE.DynamicDrawUsage);
+    this.aCol = new THREE.BufferAttribute(new Float32Array(max * 4), 4).setUsage(THREE.DynamicDrawUsage);
+    g.setAttribute('position', this.aPos); g.setAttribute('aSize', this.aSize); g.setAttribute('aCol', this.aCol);
+    g.setDrawRange(0, 0);
+    this.mat = new THREE.ShaderMaterial({
+      uniforms: { uScale: { value: 1 }, uHalfH: HALFH, uMaxPx: { value: o.maxPx || 300 },
+                  uMinPx: { value: o.minPx || 0 }, uSoft: { value: o.soft ? 1 : 0 } },
+      vertexShader: PT_VS, fragmentShader: PT_FS, transparent: true, depthWrite: false,
+      blending: o.additive ? THREE.AdditiveBlending : THREE.NormalBlending
+    });
+    this.obj = new THREE.Points(g, this.mat);
+    this.obj.frustumCulled = false; this.obj.renderOrder = o.order || 0;
+    this.out = [0, 0, 0, 0];
+  }
+  spawn(x, y, z, vx, vy, vz, life, s0, s1, k) {
+    if (this.n >= this.max) return;
+    const i = this.n++, i3 = 3 * i;
+    this.p[i3] = x; this.p[i3 + 1] = y; this.p[i3 + 2] = z;
+    this.v[i3] = vx; this.v[i3 + 1] = vy; this.v[i3 + 2] = vz;
+    this.age[i] = 0; this.life[i] = life; this.s0[i] = s0; this.s1[i] = s1; this.k[i] = k || 0;
+  }
+  update(dt) {
+    const P = this.p, V = this.v, pos = this.aPos.array, siz = this.aSize.array, col = this.aCol.array, o = this.out;
+    const damp = Math.max(0, 1 - this.drag * dt);
+    let i = 0;
+    while (i < this.n) {
+      this.age[i] += dt;
+      if (this.age[i] >= this.life[i]) {        // remove by moving the last particle into this slot
+        const j = --this.n;
+        if (j !== i) {
+          for (let a = 0; a < 3; a++) { P[3 * i + a] = P[3 * j + a]; V[3 * i + a] = V[3 * j + a]; }
+          this.age[i] = this.age[j]; this.life[i] = this.life[j]; this.s0[i] = this.s0[j]; this.s1[i] = this.s1[j]; this.k[i] = this.k[j];
+        }
+        continue;
+      }
+      const i3 = 3 * i;
+      V[i3 + 1] -= this.grav * dt;
+      V[i3] *= damp; V[i3 + 1] *= damp; V[i3 + 2] *= damp;
+      P[i3] += V[i3] * dt; P[i3 + 1] += V[i3 + 1] * dt; P[i3 + 2] += V[i3 + 2] * dt;
+      pos[i3] = P[i3]; pos[i3 + 1] = P[i3 + 1]; pos[i3 + 2] = P[i3 + 2];
+      const s = this.age[i] / this.life[i];
+      siz[i] = this.s0[i] + (this.s1[i] - this.s0[i]) * s;
+      this.color(s, this.k[i], o);
+      col[4 * i] = o[0]; col[4 * i + 1] = o[1]; col[4 * i + 2] = o[2]; col[4 * i + 3] = o[3];
+      i++;
+    }
+    this.obj.geometry.setDrawRange(0, this.n);
+    this.aPos.needsUpdate = true; this.aSize.needsUpdate = true; this.aCol.needsUpdate = true;
+  }
+}
+
+// Particle colours as they age (s runs from 0 to 1)
+function fireColor(s, k, o) {
+  if (s < 0.2) { const t = s / 0.2; o[0] = 1; o[1] = 0.92 - 0.37 * t; o[2] = 0.6 - 0.45 * t; }
+  else { const t = (s - 0.2) / 0.8; o[0] = 1 - 0.55 * t; o[1] = 0.55 - 0.5 * t; o[2] = 0.15 - 0.15 * t; }
+  o[3] = 0.85 * Math.pow(1 - s, 1.3) * (0.7 + 0.3 * k);
+}
+let NIGHT = 0;
+function smokeColor(s, k, o) {
+  const dark = k;                                          // forest smoke is darker
+  let g = (0.5 - 0.22 * dark) * (1 - 0.8 * NIGHT);
+  o[0] = g * 1.04; o[1] = g; o[2] = g * 0.93;
+  if (NIGHT > 0 && s < 0.35) {                             // at night, the base of the plume glows orange
+    const t = (1 - s / 0.35) * NIGHT;
+    o[0] += 0.75 * t; o[1] += 0.25 * t; o[2] += 0.04 * t;
+  }
+  o[3] = 0.28 * Math.min(1, s * 7) * (1 - s);
+}
+function sparkColor(s, k, o) {
+  const f = 0.6 + 0.4 * Math.sin(40 * s + 20 * k);
+  o[0] = 1; o[1] = 0.45 + 0.3 * k; o[2] = 0.1; o[3] = (1 - s) * f;
+}
+
+// Unit tree: a thin trunk and a low-polygon crown (part = 0 trunk, 1 crown)
+function treeGeometry() {
+  const parts = [[new THREE.CylinderGeometry(0.014, 0.028, 0.56, 4, 1, true).translate(0, 0.28, 0), 0],
+                 [new THREE.IcosahedronGeometry(0.34, 0).scale(1, 0.85, 1).translate(0, 0.68, 0), 1]];
+  const pos = [], nor = [], part = [];
+  for (const [g0, p] of parts) {
+    const g = g0.index ? g0.toNonIndexed() : g0;
+    g.computeVertexNormals();
+    pos.push(...g.attributes.position.array); nor.push(...g.attributes.normal.array);
+    for (let i = 0; i < g.attributes.position.count; i++) part.push(p);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('part', new THREE.Float32BufferAttribute(part, 1));
+  return g;
+}
+
+const WORLD = { obj: null, boost: 2.5, comp: null };
+const _inv = new THREE.Matrix4(), _o = new THREE.Vector3(), _d = new THREE.Vector3();
+// Where does a pointer ray hit the land? Returns model coordinates (metres) or null.
+function rayHitTerrain(ray) {
+  const w = WORLD.obj; if (!w) return null;
+  w.updateMatrixWorld(true); _inv.copy(w.matrixWorld).invert();
+  _o.copy(ray.origin).applyMatrix4(_inv); _d.copy(ray.direction).transformDirection(_inv);
+  let t0 = 0, t1 = 30000;
+  const slab = (o, d, lo, hi) => {
+    if (Math.abs(d) < 1e-9) { if (o < lo || o > hi) t0 = Infinity; return; }
+    let a = (lo - o) / d, b = (hi - o) / d; if (a > b) { const s = a; a = b; b = s; }
+    t0 = Math.max(t0, a); t1 = Math.min(t1, b);
+  };
+  slab(_o.x, _d.x, -HALF, HALF); slab(_o.z, _d.z, -HALF, HALF); slab(_o.y, _d.y, -5, 700);
+  if (!(t0 < t1)) return null;
+  const at = (t) => _o.y + _d.y * t - heightAt(_o.x + _d.x * t, _o.z + _d.z * t);
+  if (at(t0) < 0) return null;
+  const step = 5;
+  let prev = t0;
+  for (let t = t0 + step; t <= t1 + step; t += step) {
+    const tt = Math.min(t, t1);
+    if (at(tt) < 0) {
+      let a = prev, b = tt;
+      for (let k = 0; k < 12; k++) { const m = (a + b) / 2; if (at(m) < 0) b = m; else a = m; }
+      const x = _o.x + _d.x * b, z = _o.z + _d.z * b;
+      return { x, z, y: heightAt(x, z) };
+    }
+    prev = tt;
+    if (tt === t1) break;
+  }
+  return null;
+}
+
+AFRAME.registerComponent('fire-world', {
+  init: function () {
+    WORLD.obj = this.el.object3D; WORLD.comp = this;
+    const g = this.g = new THREE.Group();
+    this.buildTerrain(); this.buildSkirt(); this.buildTrees(); this.buildParticles();
+    this.buildStreaks(); this.buildWind(); this.buildCompass(); this.buildRings();
+    this.el.setObject3D('mesh', g);
+    this.tv = -1; this.fv = -1; this.treeDirty = true; this.treeT = 0;
+    this.flaming = []; this.smould = [];
+    this.grassC = new THREE.Color(); this.tmpC = new THREE.Color(); this.tmpC2 = new THREE.Color();
+    this.seen = new WeakSet(); this.v2 = new THREE.Vector2(); this.tv3 = new THREE.Vector3();
+  },
+
+  // ---------- Land surface: one mesh, one vertex per grid square ----------
+  buildTerrain: function () {
+    const n = N * N, pos = new Float32Array(n * 3);
+    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+      const c = j * N + i; pos[3 * c] = cellX(i); pos[3 * c + 2] = cellX(j);
+    }
+    const idx = new Uint32Array(6 * (N - 1) * (N - 1)); let k = 0;
+    for (let j = 0; j < N - 1; j++) for (let i = 0; i < N - 1; i++) {
+      const a = j * N + i;
+      idx[k++] = a; idx[k++] = a + N; idx[k++] = a + 1;
+      idx[k++] = a + 1; idx[k++] = a + N; idx[k++] = a + N + 1;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    this.aAlb = new THREE.BufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage);
+    this.aGlow = new THREE.BufferAttribute(new Float32Array(n), 1).setUsage(THREE.DynamicDrawUsage);
+    this.aT = new THREE.BufferAttribute(new Float32Array(n).fill(1e6), 1).setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('albedo', this.aAlb); geo.setAttribute('glow', this.aGlow); geo.setAttribute('tarr', this.aT);
+    geo.setIndex(new THREE.BufferAttribute(idx, 1));
+    this.tGeo = geo;
+    const mat = new THREE.ShaderMaterial({ uniforms: UNI, vertexShader: TERRAIN_VS, fragmentShader: TERRAIN_FS });
+    this.terrain = new THREE.Mesh(geo, mat);
+    this.terrain.frustumCulled = false;
+    this.g.add(this.terrain);
+  },
+  // Sides and base of the tabletop model, like a cut-away block of earth
+  buildSkirt: function () {
+    const n = 4 * N, pos = new Float32Array(n * 2 * 3), col = new Float32Array(n * 2 * 3), idx = [];
+    this.edge = [];
+    for (let i = 0; i < N; i++) this.edge.push(i);                       // north edge
+    for (let j = 0; j < N; j++) this.edge.push(j * N + N - 1);           // east
+    for (let i = N - 1; i >= 0; i--) this.edge.push((N - 1) * N + i);    // south
+    for (let j = N - 1; j >= 0; j--) this.edge.push(j * N);              // west
+    const top = lin('#6e5236'), bot = lin('#241a12'), side = [0.75, 0.95, 0.6, 0.85];
+    for (let k = 0; k < n; k++) {
+      const s = side[Math.floor(k / N)];
+      col.set([top.r * s, top.g * s, top.b * s], 6 * k);
+      col.set([bot.r * s, bot.g * s, bot.b * s], 6 * k + 3);
+      if (k % N < N - 1) { const a = 2 * k; idx.push(a, a + 1, a + 2, a + 2, a + 1, a + 3); }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setIndex(idx);
+    this.skirtGeo = geo;
+    this.skirtMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    const skirt = new THREE.Mesh(geo, this.skirtMat); skirt.frustumCulled = false;
+    const base = new THREE.Mesh(new THREE.PlaneGeometry(2 * HALF, 2 * HALF).rotateX(Math.PI / 2),
+                                new THREE.MeshBasicMaterial({ color: '#17110c' }));
+    base.position.y = -70;
+    this.g.add(skirt, base);
+  },
+  updateTerrain: function () {
+    const pos = this.tGeo.attributes.position.array;
+    for (let c = 0; c < N * N; c++) pos[3 * c + 1] = SIM.h[c];
+    this.tGeo.attributes.position.needsUpdate = true;
+    this.tGeo.computeVertexNormals();
+    const sp = this.skirtGeo.attributes.position.array;
+    this.edge.forEach((c, k) => {
+      const x = cellX(c % N), z = cellX((c / N) | 0);
+      sp.set([x, SIM.h[c], z, x, -70, z], 6 * k);
+    });
+    this.skirtGeo.attributes.position.needsUpdate = true;
+  },
+
+  // ---------- Trees on forest squares ----------
+  buildTrees: function () {
+    const geo = treeGeometry(), max = N * N;
+    this.iCol = new THREE.InstancedBufferAttribute(new Float32Array(max * 3), 3).setUsage(THREE.DynamicDrawUsage);
+    this.iGlow = new THREE.InstancedBufferAttribute(new Float32Array(max), 1).setUsage(THREE.DynamicDrawUsage);
+    this.iBurn = new THREE.InstancedBufferAttribute(new Float32Array(max), 1).setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('iCol', this.iCol); geo.setAttribute('iGlow', this.iGlow); geo.setAttribute('iBurn', this.iBurn);
+    const mat = new THREE.ShaderMaterial({ uniforms: UNI, vertexShader: TREE_VS, fragmentShader: TREE_FS });
+    this.trees = new THREE.InstancedMesh(geo, mat, max);
+    this.trees.count = 0; this.trees.frustumCulled = false;
+    this.treeCell = new Int32Array(max); this.treeVar = new Float32Array(max); this.cellTree = new Int32Array(max).fill(-1);
+    this.g.add(this.trees);
+  },
+  layoutTrees: function () {
+    const rnd = mulberry32(3), m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(),
+          s = new THREE.Vector3(), Y = new THREE.Vector3(0, 1, 0);
+    let n = 0;
+    this.cellTree.fill(-1); this.lastTreeFull = 0;
+    for (let c = 0; c < N * N; c++) {
+      const r1 = rnd(), r2 = rnd(), r3 = rnd(), r4 = rnd(), r5 = rnd(), r6 = rnd();
+      if (SIM.fuel[c] !== FOREST || r1 > 0.55) continue;
+      const x = cellX(c % N) + (r2 - 0.5) * DX * 0.8, z = cellX((c / N) | 0) + (r3 - 0.5) * DX * 0.8;
+      const H = 12 + 12 * r4, W = H * 0.85;
+      p.set(x, heightAt(x, z) - 0.5, z); q.setFromAxisAngle(Y, r6 * 6.28); s.set(W, H, W);
+      m.compose(p, q, s); this.trees.setMatrixAt(n, m);
+      this.treeCell[n] = c; this.cellTree[c] = n; this.treeVar[n] = r5; n++;
+    }
+    this.trees.count = n;
+    this.trees.instanceMatrix.needsUpdate = true;
+  },
+
+  buildParticles: function () {
+    this.smoke = new Particles(2200, { color: smokeColor, soft: true, order: 3, maxPx: 420 });
+    this.fire = new Particles(3200, { color: fireColor, additive: true, order: 4, maxPx: 300, minPx: 1.5 });
+    this.sparks = new Particles(1500, { color: sparkColor, additive: true, order: 5, maxPx: 40, minPx: 2, grav: 8, drag: 0.15 });
+    this.brands = new Particles(200, { color: (s, k, o) => { o[0] = 1; o[1] = 0.75; o[2] = 0.3; o[3] = 1; }, additive: true, order: 6, maxPx: 60, minPx: 3.5 });
+    this.g.add(this.smoke.obj, this.fire.obj, this.sparks.obj, this.brands.obj);
+  },
+
+  // ---------- Wind streaks, wind arrow and compass letters ----------
+  buildStreaks: function () {
+    const S = this.nStreak = 110;
+    this.st = { x: new Float32Array(S), z: new Float32Array(S), y: new Float32Array(S), age: new Float32Array(S), life: new Float32Array(S) };
+    for (let k = 0; k < S; k++) this.respawnStreak(k, true);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(S * 6), 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(S * 6), 3).setUsage(THREE.DynamicDrawUsage));
+    this.streaks = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true,
+                                          blending: THREE.AdditiveBlending, depthWrite: false }));
+    this.streaks.frustumCulled = false; this.streaks.renderOrder = 2;
+    this.g.add(this.streaks);
+  },
+  respawnStreak: function (k, anyAge) {
+    const s = this.st;
+    s.x[k] = (Math.random() * 2 - 1) * HALF; s.z[k] = (Math.random() * 2 - 1) * HALF;
+    s.y[k] = 25 + Math.random() * 90; s.life[k] = 2.5 + Math.random() * 3;
+    s.age[k] = anyAge ? Math.random() * s.life[k] : 0;
+  },
+  buildWind: function () {
+    const sh = new THREE.Shape();
+    sh.moveTo(0, -0.12); sh.lineTo(0.62, -0.12); sh.lineTo(0.62, -0.3); sh.lineTo(1, 0);
+    sh.lineTo(0.62, 0.3); sh.lineTo(0.62, 0.12); sh.lineTo(0, 0.12); sh.lineTo(0, -0.12);
+    const geo = new THREE.ShapeGeometry(sh).rotateX(-Math.PI / 2);
+    this.windArrow = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: '#9fd3ff', transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthWrite: false }));
+    this.windArrow.renderOrder = 8;
+    this.windLabel = makeLabelSprite('Wind', '#cfe8ff', 1500, 62);
+    this.g.add(this.windArrow, this.windLabel);
+  },
+  buildCompass: function () {
+    this.compass = new THREE.Group();
+    [['N', 0, -1], ['E', 1, 0], ['S', 0, 1], ['W', -1, 0]].forEach(([t, x, z]) => {
+      const sp = makeLabelSprite(t, t === 'N' ? '#ffd166' : '#d8e2ee', 1400, 90);
+      sp.position.set(x * (HALF + 110), 60, z * (HALF + 110));
+      this.compass.add(sp);
+    });
+    this.g.add(this.compass);
+  },
+  buildRings: function () {
+    this.rings = [0, 1, 2].map(() => {
+      const r = new THREE.Mesh(new THREE.RingGeometry(0.82, 1, 48).rotateX(-Math.PI / 2),
+                               new THREE.MeshBasicMaterial({ color: '#ffd166', transparent: true, opacity: 0.9, depthTest: false, depthWrite: false }));
+      r.renderOrder = 30; r.visible = false; this.g.add(r); return r;
+    });
+  },
+  setRing: function (k, hit, radius, color) {
+    const r = this.rings[k];
+    if (!hit) { r.visible = false; return; }
+    r.visible = true; r.position.set(hit.x, hit.y + 3, hit.z);
+    r.scale.setScalar(radius); r.material.color.set(color);
+  },
+
+  applyView: function () {
+    const v = SIM.view, o = this.el.object3D;
+    if (v.mode === 'table') {
+      const s = TABLE.width / L * v.zoom;
+      o.scale.setScalar(s); o.rotation.set(0, v.yaw, 0);
+      o.position.set(TABLE.x + v.panX, TABLE.y + 70 * s, TABLE.z + v.panZ);
+    } else {
+      o.scale.setScalar(1); o.rotation.set(0, v.gyaw, 0);
+      const p = this.tv3.set(v.gx, heightAt(v.gx, v.gz), v.gz).applyAxisAngle(new THREE.Vector3(0, 1, 0), v.gyaw);
+      const stageY = this.el.parentEl ? this.el.parentEl.object3D.position.y : 0;
+      o.position.set(-p.x, -p.y - stageY, -p.z);
+    }
+  },
+
+  // ---------- Colours and glow of the grid squares and trees ----------
+  // Every 0.3 s all squares are redrawn; in between only the burning ones are (to save time on the headset).
+  updateCells: function (t) {
+    const S = SIM, alb = this.aAlb.array, glow = this.aGlow.array, tarr = this.aT.array, now = S.now;
+    const timeMap = S.params.timeMap, el = Math.max(1, now - S.t0), tc = this.tmpC, tc2 = this.tmpC2;
+    const full = t - (this.lastFull || 0) > 300 || S.burnt < this.lastBurnt || S.fuelVer !== this.cellFv;
+    if (full) { this.lastFull = t; this.cellFv = S.fuelVer; }
+    if (S.burnt < this.lastBurnt) this.lastTreeFull = 0;
+    this.lastBurnt = S.burnt;
+    this.grassC.lerpColors(C.grassDry, C.grassGreen, clamp((S.params.moisture - 4) / 14, 0, 1));
+    const fl = this.flaming, sm = this.smould; fl.length = 0; sm.length = 0;
+    const one = (c) => {
+      const f = S.fuel[c], st = S.state[c];
+      const base = f === GRASS ? this.grassC : f === FOREST ? C.forestFloor : C.bare;
+      let col = base, gl = 0, ta = 1e6;
+      if (st !== 0) {
+        const F = FUELS[f], age = now - S.tIgn[c], ash = f === FOREST ? C.ashForest : C.ashGrass;
+        ta = S.tIgn[c];
+        const flick = 0.5 + 0.5 * Math.sin(t * 0.011 + c * 12.9898) * Math.sin(t * 0.027 + c * 4.1414);
+        if (st === 1 && age < F.flame) {
+          col = tc.lerpColors(base, C.char, Math.min(1, 1.5 * age / F.flame));
+          gl = 0.7 + 0.3 * flick;
+        } else if (st === 1) {
+          const k = (age - F.flame) / F.smoulder;
+          col = tc.lerpColors(C.char, ash, k);
+          gl = 0.5 * (1 - k) * (1 - k) * (0.55 + 0.45 * flick);
+        } else col = ash;
+        if (timeMap) col = ramp(VIRIDIS, (ta - S.t0) / el, tc2).multiplyScalar(0.9);
+      }
+      alb[3 * c] = col.r; alb[3 * c + 1] = col.g; alb[3 * c + 2] = col.b;
+      glow[c] = gl; tarr[c] = ta;
+    };
+    if (full) for (let c = 0; c < N * N; c++) one(c);
+    for (const c of S.active) {
+      if (!full) one(c);
+      if (now - S.tIgn[c] < FUELS[S.fuel[c]].flame) fl.push(c); else sm.push(c);
+    }
+    this.aAlb.needsUpdate = true; this.aGlow.needsUpdate = true; this.aT.needsUpdate = true;
+  },
+  updateTrees: function (t) {
+    const S = SIM, n = this.trees.count, col = this.iCol.array, gl = this.iGlow.array, br = this.iBurn.array, now = S.now;
+    const tc = this.tmpC, dry = clamp((10 - S.params.moisture) / 8, 0, 1);
+    const full = t - (this.lastTreeFull || 0) > 300;
+    if (full) this.lastTreeFull = t;
+    const one = (k) => {
+      const c = this.treeCell[k], st = S.state[c], v = 0.75 + 0.5 * this.treeVar[k];
+      let g = 0, b = 0;
+      tc.lerpColors(C.crown, C.crownDry, dry * this.treeVar[k]).multiplyScalar(v);
+      if (st !== 0) {
+        const F = FUELS[FOREST], age = now - S.tIgn[c];
+        const flick = 0.5 + 0.5 * Math.sin(t * 0.013 + k * 7.31) * Math.sin(t * 0.029 + k * 3.7);
+        if (st === 1 && age < F.flame) {
+          const a = age / F.flame;
+          tc.lerp(C.char, Math.min(1, 2 * a)); g = (0.45 + 0.3 * flick) * (1 - 0.6 * a); b = 0.6 * a;
+        } else if (st === 1) {
+          const a = (age - F.flame) / F.smoulder;
+          tc.copy(C.char); g = 0.35 * (1 - a) * (1 - a) * (0.5 + 0.5 * flick); b = 0.6 + 0.4 * Math.min(1, 3 * a);
+        } else { tc.copy(C.char); b = 1; }
+      }
+      col[3 * k] = tc.r; col[3 * k + 1] = tc.g; col[3 * k + 2] = tc.b; gl[k] = g; br[k] = b;
+    };
+    if (full) { for (let k = 0; k < n; k++) one(k); }
+    else for (const c of S.active) { const k = this.cellTree[c]; if (k >= 0 && k < n) one(k); }
+    this.iCol.needsUpdate = true; this.iGlow.needsUpdate = true; this.iBurn.needsUpdate = true;
+  },
+
+  // ---------- Flames, smoke, sparks and embers ----------
+  spawnParticles: function (dt) {
+    const B = WORLD.boost, U = SIM.params.windSpeed, w = windToward(), lean = Math.min(U, 60) / 60;
+    const fl = this.flaming, sm = this.smould, R = Math.random;
+    const cellPos = (c) => {
+      const x = cellX(c % N) + (R() - 0.5) * DX, z = cellX((c / N) | 0) + (R() - 0.5) * DX;
+      return [x, heightAt(x, z), z];
+    };
+    const flameH = (c) => {
+      const F = FUELS[SIM.fuel[c]];
+      return F.flameH * clamp(Math.pow(SIM.ros[c] / F.R0, 0.46), 0.6, 3.5);   // flame length grows with intensity
+    };
+    if (fl.length) {
+      // flames: keep roughly 4 particles alive per flaming square, within the pool
+      const fire = this.fire;
+      fire.acc += Math.min(fire.max, fl.length * 4) * dt / 0.55;
+      while (fire.acc >= 1) {
+        fire.acc--;
+        const c = fl[(R() * fl.length) | 0], fh = flameH(c) * B, [x, y, z] = cellPos(c);
+        const life = 0.35 + R() * 0.4, up = fh / life * (0.7 + R() * 0.6);
+        const y0 = y + (SIM.fuel[c] === FOREST ? R() * 10 * B : 0);
+        fire.spawn(x, y0, z, w[0] * up * lean * 0.8, up, w[1] * up * lean * 0.8, life, fh * 0.75, fh * 0.3, R());
+      }
+      // sparks
+      const sp = this.sparks;
+      sp.acc += Math.min(350, fl.length * 0.8 * (0.4 + U / 40)) * dt;
+      while (sp.acc >= 1) {
+        sp.acc--;
+        const c = fl[(R() * fl.length) | 0], fh = flameH(c) * B, [x, y, z] = cellPos(c);
+        const life = 1.2 + R() * 1.6, h = U * 3.5 * (0.5 + R());
+        sp.spawn(x, y + fh * 0.5, z, w[0] * h + (R() - 0.5) * 30, (50 + R() * 150) / life * Math.sqrt(B),
+                 w[1] * h + (R() - 0.5) * 30, life, 3.5 * B, 2 * B, R());
+      }
+    }
+    // smoke: from flaming squares (big plumes) and smouldering squares (wisps)
+    const smk = this.smoke;
+    smk.acc += (fl.length * 0.5 + sm.length * 0.05) * dt;
+    smk.acc = Math.min(smk.acc, smk.max - smk.n);
+    while (smk.acc >= 1) {
+      smk.acc--;
+      const fromFlame = R() * (fl.length * 0.5 + sm.length * 0.05) < fl.length * 0.5;
+      const list = fromFlame ? fl : sm;
+      if (!list.length) break;
+      const c = list[(R() * list.length) | 0], forest = SIM.fuel[c] === FOREST, [x, y, z] = cellPos(c);
+      const plume = fromFlame ? (forest ? 1000 : 380) * Math.sqrt(flameH(c) / FUELS[SIM.fuel[c]].flameH) : 160;
+      const life = 7 + R() * 4, drift = U * 5 * (0.5 + 0.5 * R());
+      smk.spawn(x, y + 5, z, w[0] * drift + (R() - 0.5) * 20, plume / life * (0.7 + 0.6 * R()),
+                w[1] * drift + (R() - 0.5) * 20, life, fromFlame ? 50 : 25, fromFlame ? 230 + 200 * R() : 90,
+                fromFlame && forest ? 1 : 0.3);
+    }
+    // a burst of sparks wherever a new fire starts (including spot fires)
+    for (const f of SIM.flashes) {
+      if (this.seen.has(f)) continue;
+      this.seen.add(f);
+      const [x, y, z] = cellPos(f.c);
+      for (let k = 0; k < 30; k++) {
+        const a = R() * 6.28, sp = 20 + R() * 40;
+        this.sparks.spawn(x, y + 5, z, Math.cos(a) * sp, (40 + R() * 80) * Math.sqrt(B), Math.sin(a) * sp, 0.8 + R(), 5 * B, 2 * B, R());
+      }
+    }
+  },
+  updateBrands: function () {
+    const b = this.brands, B = WORLD.boost;
+    b.n = 0;
+    for (const e of SIM.embers) {
+      const s = Math.min(1, e.age / e.dur), x = e.x0 + (e.x1 - e.x0) * s, z = e.z0 + (e.z1 - e.z0) * s;
+      const ground = e.h0 + (heightAt(e.x1, e.z1) - e.h0) * s;
+      b.spawn(x, ground + (150 + 0.4 * e.dist) * 4 * s * (1 - s) * Math.sqrt(B) + 10, z, 0, 0, 0, 1e9, 10 * B, 10 * B, 0);
+    }
+    b.update(0);
+  },
+  updateStreaks: function (dt) {
+    const on = SIM.params.streaks && SIM.params.windSpeed >= 1 && SIM.view.mode === 'table';
+    this.streaks.visible = on;
+    if (!on) return;
+    const s = this.st, w = windToward(), U = SIM.params.windSpeed, sp = U * 5, len = Math.max(40, U * 5);
+    const pos = this.streaks.geometry.attributes.position.array, col = this.streaks.geometry.attributes.color.array;
+    for (let k = 0; k < this.nStreak; k++) {
+      s.age[k] += dt; s.x[k] += w[0] * sp * dt; s.z[k] += w[1] * sp * dt;
+      if (s.age[k] > s.life[k] || Math.abs(s.x[k]) > HALF || Math.abs(s.z[k]) > HALF) this.respawnStreak(k, false);
+      const x = s.x[k], z = s.z[k], tx = x - w[0] * len, tz = z - w[1] * len;
+      const a = Math.min(1, s.age[k] / 0.6, (s.life[k] - s.age[k]) / 0.6) * 0.38 * (1 - 0.6 * NIGHT);
+      pos.set([x, heightAt(x, z) + s.y[k], z, tx, heightAt(tx, tz) + s.y[k], tz], 6 * k);
+      col.set([a, a, a * 1.1, 0, 0, 0], 6 * k);
+    }
+    this.streaks.geometry.attributes.position.needsUpdate = true;
+    this.streaks.geometry.attributes.color.needsUpdate = true;
+  },
+  updateWindArrow: function () {
+    const U = SIM.params.windSpeed, w = windToward(), table = SIM.view.mode === 'table';
+    const show = table && U >= 1;
+    this.windArrow.visible = show;
+    this.windLabel.visible = table;
+    this.compass.visible = table;
+    const len = 250 + 11 * U;
+    this.windArrow.scale.set(len, 1, 260);
+    this.windArrow.rotation.y = Math.atan2(-w[1], w[0]);
+    this.windArrow.position.set(-w[0] * (HALF + 180 + len), 300, -w[1] * (HALF + 180 + len));
+    this.windLabel.position.set(-w[0] * (HALF + 180 + len / 2), 470, -w[1] * (HALF + 180 + len / 2));
+    this.windLabel.setText(U < 1 ? 'Calm' : `Wind ${Math.round(U)} km/h from ${compassName(SIM.params.windDir)}`);
+  },
+
+  tick: function (t, dtMs) {
+    const dt = Math.min((dtMs || 16) / 1000, 0.1), v = SIM.view, sc = this.el.sceneEl;
+    WORLD.boost = v.mode === 'table' ? 2.5 : 1;
+    this.applyView();
+    if (SIM.terrainVer !== this.tv) { this.tv = SIM.terrainVer; this.updateTerrain(); this.treeDirty = true; }
+    if (SIM.fuelVer !== this.fv) { this.fv = SIM.fuelVer; this.treeDirty = true; }
+    if (this.treeDirty && t - this.treeT > 250) { this.treeDirty = false; this.treeT = t; this.layoutTrees(); }
+    this.updateCells(t);
+    this.updateTrees(t);
+    this.spawnParticles(dt);
+    this.smoke.update(dt); this.fire.update(dt); this.sparks.update(dt);
+    this.updateBrands();
+    this.updateStreaks(dt);
+    this.updateWindArrow();
+    // particle sizes need the world scale and the viewport size
+    const r = sc.renderer;
+    const bl = r.xr.isPresenting && r.xr.getBaseLayer ? r.xr.getBaseLayer() : null;
+    if (bl) HALFH.value = (bl.framebufferHeight || bl.textureHeight || 1700) / 2;
+    else { r.getDrawingBufferSize(this.v2); HALFH.value = this.v2.y / 2; }
+    const s = this.el.object3D.scale.x;
+    for (const p of [this.smoke, this.fire, this.sparks, this.brands]) p.mat.uniforms.uScale.value = s;
+    // lighting, fire map and night
+    NIGHT += ((SIM.params.night ? 1 : 0) - NIGHT) * Math.min(1, dt * 3);
+    UNI.uLight.value = 0.85 - 0.79 * NIGHT; UNI.uAmb.value = 0.38 - 0.32 * NIGHT;
+    UNI.uNow.value = SIM.now; UNI.uT0.value = SIM.t0; UNI.uShowTime.value = SIM.params.timeMap ? 1 : 0;
+    UNI.uTopo.value = v.mode === 'table' ? 0.14 : 0.05;
+    UNI.uSpeck.value = v.mode === 'table' ? 0 : 1;
+    this.skirtMat.color.setScalar(1 - 0.8 * NIGHT);
+  }
+});
+
+// ---------- Sky: a gradient dome, darker at night and tinted by smoke ----------
+AFRAME.registerComponent('sky-dome', {
+  init: function () {
+    this.u = { uHor: { value: new THREE.Color() }, uZen: { value: new THREE.Color() }, uGnd: { value: new THREE.Color() } };
+    const mat = new THREE.ShaderMaterial({
+      uniforms: this.u, side: THREE.BackSide, depthWrite: false,
+      vertexShader: 'varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+      fragmentShader: `uniform vec3 uHor; uniform vec3 uZen; uniform vec3 uGnd; varying vec3 vD;
+        void main(){ float y = vD.y; vec3 c = y > 0.0 ? mix(uHor, uZen, pow(y, 0.55)) : mix(uHor, uGnd, min(1.0, -y * 6.0));
+        gl_FragColor = vec4(c, 1.0);
+        #include <colorspace_fragment>
+        }`
+    });
+    this.dome = new THREE.Mesh(new THREE.SphereGeometry(6000, 32, 16), mat);
+    this.dome.renderOrder = -10; this.dome.frustumCulled = false;
+    this.el.object3D.add(this.dome);
+    this.c = { dHor: lin('#c9d6e2'), dZen: lin('#4f7fb6'), nHor: lin('#1b1726'), nZen: lin('#03050b'),
+               smoke: lin('#b98a5a'), glow: lin('#7a2a0c'), dGnd: lin('#2f3a2a'), nGnd: lin('#050605') };
+  },
+  tick: function () {
+    const n = NIGHT, w = WORLD.comp, f = w ? Math.min(1, w.flaming.length / 1200) : 0, c = this.c, u = this.u;
+    u.uHor.value.lerpColors(c.dHor, c.nHor, n).lerp(n > 0.5 ? c.glow : c.smoke, f * 0.55);
+    u.uZen.value.lerpColors(c.dZen, c.nZen, n).lerp(c.smoke, f * 0.25 * (1 - n));
+    u.uGnd.value.lerpColors(c.dGnd, c.nGnd, n);
+  }
+});
+
+// ---------- Floor under your feet in tabletop view ----------
+AFRAME.registerComponent('floor-disc', {
+  init: function () {
+    const g = new THREE.Group();
+    this.mat = new THREE.MeshBasicMaterial({ color: '#1d2328' });
+    const floor = new THREE.Mesh(new THREE.CircleGeometry(9, 64).rotateX(-Math.PI / 2), this.mat);
+    const ring = new THREE.Mesh(new THREE.RingGeometry(0.98, 1.02, 64).rotateX(-Math.PI / 2),
+                                new THREE.MeshBasicMaterial({ color: '#2f7fb8' }));
+    ring.position.y = 0.003;
+    g.add(floor, ring);
+    this.el.setObject3D('mesh', g);
+  },
+  tick: function () {
+    this.el.object3D.visible = SIM.view.mode === 'table';
+    this.mat.color.setRGB(0.012 + 0.0 * NIGHT, 0.016, 0.02).multiplyScalar(1 - 0.6 * NIGHT);
+  }
+});
+
+// ---------- Tools: what the trigger does when you point at the land ----------
+const TOOLS = {
+  ignite: { label: 'Start fire', color: '#ff8a3d', r: 14,
+            hint: 'Point at the land and pull the trigger to start a fire. Hold the trigger and sweep to light a line of fire.' },
+  raise:  { label: 'Raise ground', color: '#ffd166', r: 180, hint: 'Hold the trigger and sweep to build up hills.' },
+  lower:  { label: 'Lower ground', color: '#7cc4ff', r: 180, hint: 'Hold the trigger and sweep to dig valleys.' },
+  break:  { label: 'Firebreak', color: '#f0dfbf', r: 30,
+            hint: 'Hold the trigger and sweep to clear a firebreak. Flames cannot cross bare ground, but embers can jump it.' },
+  forest: { label: 'Plant forest', color: '#7ee0a0', r: 70, hint: 'Hold the trigger and sweep to plant forest on unburnt ground.' },
+  stand:  { label: 'Stand here', color: '#ffffff', r: 15,
+            hint: 'Point at the land and pull the trigger to stand there, at full size. Use the "Back to tabletop" button to return.' }
+};
+const _cdir = new THREE.Vector3();
+function camYaw() {
+  const sc = document.querySelector('a-scene');
+  if (!sc || !sc.camera) return 0;
+  sc.camera.getWorldDirection(_cdir);
+  return Math.atan2(-_cdir.x, -_cdir.z);
+}
+
+AFRAME.registerComponent('terrain-tools', {
+  init: function () {
+    this.src = [{ kind: 'mouse', held: false, hit: null, last: -1 },
+                { kind: 'hand', sel: '#handL', held: false, hit: null, last: -1, axes: [0, 0] },
+                { kind: 'hand', sel: '#handR', held: false, hit: null, last: -1, axes: [0, 0], snapped: false }];
+    this.keys = {};
+    window.addEventListener('keydown', (e) => { this.keys[e.key.toLowerCase()] = true; });
+    window.addEventListener('keyup', (e) => { this.keys[e.key.toLowerCase()] = false; });
+    window.addEventListener('mouseup', (e) => {
+      if (!(e instanceof MouseEvent)) return;   // A-Frame also emits its own (non-mouse) 'mouseup' events
+      // with a mouse, "Start fire" and "Stand here" act on a click, so dragging to look around does nothing
+      const m = this.src[0];
+      if (m.down && Math.hypot(e.clientX - m.down[0], e.clientY - m.down[1]) < 6 && m.hit) {
+        if (SIM.tool === 'ignite') startFire(m.hit.x, m.hit.z);
+        if (SIM.tool === 'stand') enterGround(m.hit.x, m.hit.z);
+      }
+      m.down = null;
+      this.release(m);
+    });
+  },
+  attach: function () {
+    const sc = this.el;
+    for (const s of this.src) {
+      if (!s.sel || s.el) continue;
+      s.el = document.querySelector(s.sel);
+      if (!s.el) continue;
+      s.el.addEventListener('triggerdown', () => { if (!this.overUI(s)) this.press(s); });
+      s.el.addEventListener('triggerup', () => this.release(s));
+      s.el.addEventListener('thumbstickmoved', (e) => { s.axes = [e.detail.x, e.detail.y]; });
+    }
+    if (!this.canvasOn && sc.canvas) {
+      this.canvasOn = true;
+      sc.canvas.addEventListener('mousedown', (e) => {
+        if (e.button !== 0 || sc.is('vr-mode') || this.overUI(this.src[0])) return;
+        this.src[0].down = [e.clientX, e.clientY];
+        this.press(this.src[0]);
+      });
+      sc.canvas.addEventListener('wheel', (e) => {
+        if (SIM.view.mode === 'table') SIM.view.zoom = clamp(SIM.view.zoom * Math.exp(-e.deltaY * 0.001), 0.5, 5);
+      }, { passive: true });
+    }
+  },
+  ray: function (s) {
+    const rc = s.kind === 'mouse' ? this.el.components.raycaster : s.el && s.el.components.raycaster;
+    return rc && rc.raycaster ? rc.raycaster.ray : null;
+  },
+  overUI: function (s) {
+    const rc = s.kind === 'mouse' ? this.el.components.raycaster : s.el && s.el.components.raycaster;
+    return !!(rc && rc.intersectedEls && rc.intersectedEls.length);
+  },
+  press: function (s) {
+    const hit = s.hit;
+    s.last = -1;
+    if (s.kind === 'mouse') {
+      if (SIM.tool === 'ignite' || SIM.tool === 'stand' || !hit) return;   // handled on mouse up
+      const cam = document.querySelector('[camera]');
+      if (cam) cam.setAttribute('look-controls', 'enabled', false);
+    }
+    s.held = true;
+    if (!hit) return;
+    if (SIM.tool === 'stand') { enterGround(hit.x, hit.z); s.held = false; }
+  },
+  release: function (s) {
+    if (!s.held) return;
+    s.held = false;
+    if (s.kind === 'mouse') {
+      const cam = document.querySelector('[camera]');
+      if (cam) cam.setAttribute('look-controls', 'enabled', true);
+    }
+  },
+  apply: function (s, hit, dt) {
+    switch (SIM.tool) {
+      case 'ignite': {
+        const c = cellIdx(hit.x, hit.z);
+        if (c !== s.last) { startFire(hit.x, hit.z); s.last = c; }
+        break;
+      }
+      case 'raise': sculpt(hit.x, hit.z, TOOLS.raise.r, 110 * dt); break;
+      case 'lower': sculpt(hit.x, hit.z, TOOLS.lower.r, -110 * dt); break;
+      case 'break': paintFuel(hit.x, hit.z, TOOLS.break.r, NONE); break;
+      case 'forest': paintFuel(hit.x, hit.z, TOOLS.forest.r, FOREST); break;
+    }
+  },
+  tick: function (t, dtMs) {
+    const comp = WORLD.comp; if (!comp) return;
+    this.attach();
+    const dt = Math.min((dtMs || 16) / 1000, 0.1), vr = this.el.is('vr-mode'), v = SIM.view, tool = TOOLS[SIM.tool];
+    const scale = WORLD.obj.scale.x;
+    this.src.forEach((s, k) => {
+      const active = s.kind === 'mouse' ? !vr : vr;
+      let hit = null;
+      if (active) { const ray = this.ray(s); if (ray && !this.overUI(s)) hit = rayHitTerrain(ray); }
+      s.hit = hit;
+      comp.setRing(k, hit, Math.max(tool.r, 0.012 / scale), tool.color);
+      if (s.held && hit) this.apply(s, hit, dt);
+    });
+    // thumbsticks
+    const Ls = this.src[1].axes, Rs = this.src[2].axes;
+    if (v.mode === 'table') {
+      if (Math.abs(Rs[0]) > 0.15) v.yaw -= Rs[0] * dt * 1.4;
+      if (Math.abs(Rs[1]) > 0.15) v.zoom = clamp(v.zoom * Math.exp(-Rs[1] * dt * 1.3), 0.5, 5);
+      if (Math.hypot(Ls[0], Ls[1]) > 0.15) this.pan(-Ls[0], -Ls[1], dt);
+    } else {
+      if (Math.abs(Rs[0]) > 0.7 && !this.src[2].snapped) { v.gyaw += Math.sign(Rs[0]) * Math.PI / 6; this.src[2].snapped = true; }
+      if (Math.abs(Rs[0]) < 0.3) this.src[2].snapped = false;
+    }
+    // keyboard on a computer
+    const K = this.keys;
+    if (v.mode === 'table') {
+      if (K.q) v.yaw += dt * 1.2; if (K.e) v.yaw -= dt * 1.2;
+      if (K.r) v.zoom = clamp(v.zoom * Math.exp(dt), 0.5, 5); if (K.f) v.zoom = clamp(v.zoom * Math.exp(-dt), 0.5, 5);
+      const px = (K.arrowright ? -1 : 0) + (K.arrowleft ? 1 : 0), pz = (K.arrowup ? 1 : 0) + (K.arrowdown ? -1 : 0);
+      if (px || pz) this.pan(px, pz, dt);
+    } else {
+      if (K.q) v.gyaw += dt * 1.2; if (K.e) v.gyaw -= dt * 1.2;
+    }
+  },
+  // slide the table: (dx, dz) in the viewer's own frame, +dz towards the viewer
+  pan: function (dx, dz, dt) {
+    const v = SIM.view, cy = camYaw(), c = Math.cos(cy), s = Math.sin(cy);
+    v.panX = clamp(v.panX + (dx * c + dz * s) * dt * 1.2, -5, 5);
+    v.panZ = clamp(v.panZ + (-dx * s + dz * c) * dt * 1.2, -5, 5);
+  }
+});
+
+// ---------- Runs the model, and the delayed ignition in explainer steps ----------
+AFRAME.registerComponent('sim-runner', {
+  init: function () {
+    this.el.addEventListener('loaded', () => {
+      const lc = document.querySelector('[camera]').components['look-controls'];
+      if (lc && lc.pitchObject) lc.pitchObject.rotation.x = -0.5;
+    });
+  },
+  tick: function (t, dt) {
+    stepModel(Math.min((dt || 16) / 1000, 0.1));
+    const pd = SIM.pending;
+    if (pd && performance.now() > pd.at) {
+      SIM.pending = null;
+      for (const [x, z] of pd.pts || []) startFire(x, z);
+      if (pd.wc) SIM.windChange = Object.assign({}, pd.wc);
+    }
+  }
+});
+
+// ---------- Draggable slider (works with Quest controllers and a mouse) ----------
+AFRAME.registerComponent('ui-slider', {
+  schema: { key: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' },
+            step: { type: 'number', default: 1 }, decimals: { type: 'int', default: 0 },
+            label: { type: 'string' }, unit: { type: 'string', default: '' },
+            width: { type: 'number', default: 0.56 }, dynamic: { type: 'boolean', default: false } },
+  init: function () {
+    const d = this.data, w = d.width, o = new THREE.Group();
+    const basic = (col, opts) => new THREE.MeshBasicMaterial(Object.assign({ color: col, transparent: true }, opts || {}));
+    this.label = makeCanvasPlane(w, Math.round(640 * w / 0.56), 52);
+    this.lw = this.label.canvas.width;
+    this.label.mesh.position.set(0, 0.028, 0.001); o.add(this.label.mesh);
+    this.trackMat = basic('#26364d');
+    const track = new THREE.Mesh(new THREE.PlaneGeometry(w, 0.012), this.trackMat);
+    track.position.set(0, -0.018, 0.001); o.add(track);
+    const fg = new THREE.PlaneGeometry(w, 0.012); fg.translate(w / 2, 0, 0);
+    this.fillMat = basic('#e07a3c');
+    this.fill = new THREE.Mesh(fg, this.fillMat); this.fill.position.set(-w / 2, -0.018, 0.0015); o.add(this.fill);
+    this.knobMat = basic('#eef3f8');
+    this.knob = new THREE.Mesh(new THREE.CircleGeometry(0.02, 32), this.knobMat);
+    this.knob.position.set(0, -0.018, 0.002); o.add(this.knob);
+    const hit = new THREE.Mesh(new THREE.PlaneGeometry(w + 0.06, 0.1), basic('#ffffff', { opacity: 0, depthWrite: false }));
+    hit.position.set(0, 0.005, 0.0005); o.add(hit);
+    this.el.setObject3D('ui', o);
+    this.hover = false; this.dragging = false; this.drawn = '';
+    this.el.addEventListener('mouseenter', () => { this.hover = true; });
+    this.el.addEventListener('mouseleave', () => { this.hover = false; });
+    this.el.addEventListener('mousedown', (e) => {
+      this.cursorEl = e.detail.cursorEl; this.dragging = true;
+      this.setFromHit(e.detail.intersection);
+      holdLook(this.cursorEl, () => { this.dragging = false; });
+    });
+  },
+  setFromHit: function (hit) {
+    if (!hit) return;
+    const d = this.data, lp = this.el.object3D.worldToLocal(hit.point.clone());
+    const frac = clamp((lp.x + d.width / 2) / d.width, 0, 1);
+    let v = d.min + frac * (d.max - d.min);
+    v = Math.round(v / d.step) * d.step;
+    SIM.params[d.key] = clamp(v, d.min, d.max);
+    if (d.key === 'windDir' || d.key === 'windSpeed') SIM.windChange = null;   // you have taken over the wind
+  },
+  tick: function () {
+    const d = this.data;
+    let shown = panelActive(this.el);
+    if (d.dynamic) {                      // explainer slider: takes its settings from the current step
+      const cfg = SIM.mode === 'explain' ? STEPS[SIM.step].slider : null;
+      if (cfg) Object.assign(d, cfg); else shown = false;
+      this.el.object3D.visible = !!cfg;
+    }
+    setClickable(this.el, shown);
+    if (!shown) { this.dragging = false; return; }
+    if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
+      this.setFromHit(this.cursorEl.components.raycaster.getIntersection(this.el));
+    }
+    const v = SIM.params[d.key], frac = clamp((v - d.min) / (d.max - d.min), 0, 1);
+    this.knob.position.x = -d.width / 2 + frac * d.width;
+    this.fill.scale.x = Math.max(frac, 0.0001);
+    this.knobMat.color.set(this.hover || this.dragging ? '#ffd166' : '#eef3f8');
+    this.knob.scale.setScalar(this.hover || this.dragging ? 1.25 : 1);
+    let valTxt = `${v.toFixed(d.decimals)} ${d.unit}`;
+    if (d.key === 'windDir') valTxt = `${compassName(v)}  (${Math.round(v)}°)`;
+    if (d.key === 'moisture' && v >= 25) valTxt = 'too wet to burn';
+    const txt = `${d.label}|${valTxt}`;
+    if (txt !== this.drawn) {
+      this.drawn = txt;
+      const c = this.label.ctx, W = this.lw; c.clearRect(0, 0, W, 52);
+      c.textBaseline = 'middle'; c.fillStyle = COL.text;
+      c.font = `30px ${FONT}`; c.textAlign = 'left'; c.fillText(d.label, 2, 28);
+      c.font = `700 30px ${FONT}`; c.textAlign = 'right'; c.fillText(valTxt, W - 2, 28);
+      this.label.tex.needsUpdate = true;
+    }
+  }
+});
+
+// An element is clickable only while its panel's mode is showing (hidden panels must not catch the pointer)
+function panelActive(el) {
+  if (el._modeEl === undefined) el._modeEl = el.closest('[mode-visible]');
+  return !el._modeEl || el._modeEl.getAttribute('mode-visible').mode === SIM.mode;
+}
+function setClickable(el, on) {
+  if (el._clickable === on) return;
+  el._clickable = on;
+  if (on) el.classList.add('clickable'); else el.classList.remove('clickable');
+}
+AFRAME.registerComponent('mode-visible', {
+  schema: { mode: { type: 'string', default: 'main' } },
+  tick: function () { this.el.object3D.visible = SIM.mode === this.data.mode; }
+});
+// While dragging with the mouse, stop the camera from rotating; call onUp when released
+function holdLook(cursorEl, onUp) {
+  const cam = document.querySelector('[camera]');
+  const mouse = cursorEl === cursorEl.sceneEl || cursorEl.tagName === 'A-SCENE';
+  if (mouse && cam) cam.setAttribute('look-controls', 'enabled', false);
+  const up = () => {
+    onUp();
+    if (mouse && cam) cam.setAttribute('look-controls', 'enabled', true);
+    cursorEl.removeEventListener('mouseup', up);
+  };
+  cursorEl.addEventListener('mouseup', up);
+}
+
+// ---------- Grab and move panels by their handle bar ----------
+function copyPose(fromSel, toSel) {
+  const a = document.querySelector(fromSel).object3D, b = document.querySelector(toSel).object3D;
+  b.position.copy(a.position); b.rotation.y = a.rotation.y;
+}
+AFRAME.registerComponent('grab-move', {
+  schema: { target: { type: 'selector' }, label: { type: 'string', default: '' }, width: { type: 'number', default: 0.6 } },
+  init: function () {
+    this.c = makeCanvasPlane(this.data.width, 768, 80);
+    const grp = new THREE.Group(); grp.add(this.c.mesh);
+    this.el.setObject3D('ui', grp);
+    this.hover = false; this.dragging = false; this.drawn = '';
+    this.offset = new THREE.Vector3(); this.tmp = new THREE.Vector3(); this.cam = new THREE.Vector3();
+    this.el.addEventListener('mouseenter', () => { this.hover = true; });
+    this.el.addEventListener('mouseleave', () => { this.hover = false; });
+    this.el.addEventListener('mousedown', (e) => {
+      const hit = e.detail.intersection; if (!hit || !panelActive(this.el)) return;
+      this.cursorEl = e.detail.cursorEl; this.dragging = true;
+      this.dist = hit.distance;
+      const tg = this.data.target.object3D;
+      tg.updateMatrixWorld(true);
+      this.offset.copy(tg.worldToLocal(hit.point.clone()));
+      holdLook(this.cursorEl, () => { this.dragging = false; });
+    });
+  },
+  tick: function () {
+    setClickable(this.el, panelActive(this.el));
+    if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
+      const ray = this.cursorEl.components.raycaster.raycaster.ray;
+      const tg = this.data.target.object3D, parent = tg.parent;
+      const target = parent.worldToLocal(this.tmp.copy(ray.direction).multiplyScalar(this.dist).add(ray.origin));
+      this.el.sceneEl.camera.getWorldPosition(this.cam); parent.worldToLocal(this.cam);
+      tg.rotation.y = Math.atan2(this.cam.x - target.x, this.cam.z - target.z);   // keep facing the viewer
+      tg.position.copy(target);
+      tg.updateMatrix();
+      tg.position.sub(this.offset.clone().applyQuaternion(tg.quaternion));
+    }
+    const key = this.hover + '' + this.dragging;
+    if (key === this.drawn) return;
+    this.drawn = key;
+    const c = this.c.ctx, on = this.hover || this.dragging;
+    c.clearRect(0, 0, 768, 80);
+    c.fillStyle = on ? '#3a86b8' : '#22324a'; roundRect(c, 4, 4, 760, 72, 36); c.fill();
+    c.fillStyle = COL.text; c.font = `600 32px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(this.dragging ? 'Moving… release to place' : '✥  ' + this.data.label, 384, 42);
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Buttons ----------
+const onOff = (b) => (b ? 'ON' : 'OFF');
+const TOGGLE_NAMES = { slope: 'Slope effect', spotting: 'Embers', timeMap: 'Fire map' };
+AFRAME.registerComponent('ui-button', {
+  schema: { action: { type: 'string' }, width: { type: 'number', default: 0.27 } },
+  init: function () {
+    this.W = Math.round(512 * this.data.width / 0.27);
+    this.c = makeCanvasPlane(this.data.width, this.W, 124);
+    const grp = new THREE.Group(); grp.add(this.c.mesh);
+    this.el.setObject3D('ui', grp);
+    this.hover = false; this.drawn = '';
+    this.el.addEventListener('mouseenter', () => { this.hover = true; });
+    this.el.addEventListener('mouseleave', () => { this.hover = false; });
+    this.el.addEventListener('click', () => this.act());
+  },
+  act: function () {
+    const p = SIM.params, a = this.data.action;
+    if (a.startsWith('tool:')) { SIM.tool = a.slice(5); return; }
+    switch (a) {
+      case 'terrain': {
+        const k = (TERRAINS.findIndex((x) => x[0] === SIM.terrain) + 1) % TERRAINS.length;
+        genTerrain(TERRAINS[k][0]); genFuel(SIM.fuelMap); resetFire(); break;
+      }
+      case 'fuel': {
+        const k = (FUELMAPS.findIndex((x) => x[0] === SIM.fuelMap) + 1) % FUELMAPS.length;
+        genFuel(FUELMAPS[k][0]); resetFire(); break;
+      }
+      case 'slope': p.slope = !p.slope; break;
+      case 'spotting': p.spotting = !p.spotting; break;
+      case 'windchange': SIM.windChange = { at: SIM.started ? SIM.now - SIM.t0 : 0, dir: (p.windDir + 270) % 360 }; break;
+      case 'timemap': p.timeMap = !p.timeMap; break;
+      case 'night': p.night = !p.night; break;
+      case 'streaks': p.streaks = !p.streaks; break;
+      case 'pause': p.paused = !p.paused; break;
+      case 'resetfire': resetFire(); break;
+      case 'view':
+        if (SIM.view.mode === 'table') { const [x, z] = lookoutPoint(); enterGround(x, z); }
+        else SIM.view.mode = 'table';
+        break;
+      case 'explain': copyPose('#panel', '#explainer'); enterExplainer(); break;
+      case 'prev': applyStep(SIM.step - 1); break;
+      case 'next':
+        if (SIM.step < STEPS.length - 1) applyStep(SIM.step + 1);
+        else { copyPose('#explainer', '#panel'); exitExplainer(); }
+        break;
+      case 'replay': if (!STEPS[SIM.step].keep) applyStep(SIM.step); break;
+      case 'eq': SIM.showEq = !SIM.showEq; break;
+      case 'exit': copyPose('#explainer', '#panel'); exitExplainer(); break;
+      case 'xtoggle': { const k = STEPS[SIM.step].toggle; if (k) p[k] = !p[k]; break; }
+    }
+  },
+  state: function () {
+    const p = SIM.params, a = this.data.action;
+    if (a.startsWith('tool:')) { const t = a.slice(5); return [TOOLS[t].label, SIM.tool === t]; }
+    switch (a) {
+      case 'terrain': return [`Land: ${TERRAINS.find((x) => x[0] === SIM.terrain)[1]}  ▸`, false];
+      case 'fuel': return [`Fuel: ${FUELMAPS.find((x) => x[0] === SIM.fuelMap)[1]}  ▸`, false];
+      case 'slope': return [`Slope effect: ${onOff(p.slope)}`, p.slope];
+      case 'spotting': return [`Embers: ${onOff(p.spotting)}`, p.spotting];
+      case 'windchange': return [SIM.windChange ? 'Wind change coming…' : 'Wind change  ↻', !!SIM.windChange];
+      case 'timemap': return [`Fire map: ${onOff(p.timeMap)}`, p.timeMap];
+      case 'night': return [`Night: ${onOff(p.night)}`, p.night];
+      case 'streaks': return [`Wind streaks: ${onOff(p.streaks)}`, p.streaks];
+      case 'pause': return [p.paused ? '▶  Resume' : '❚❚  Pause', p.paused];
+      case 'resetfire': return ['↺  Reset fire', false];
+      case 'view': return [SIM.view.mode === 'table' ? 'Stand on the highest hill  ▸' : '◀  Back to the tabletop', SIM.view.mode !== 'table'];
+      case 'explain': return ['Explain step by step  ▶', true];
+      case 'prev': return ['◀  Back', false];
+      case 'next': return [SIM.step < STEPS.length - 1 ? 'Next  ▶' : 'Finish  ✓', true];
+      case 'replay': return ['↺  Replay', false];
+      case 'eq': return [SIM.showEq ? 'Hide equations' : 'Equations', SIM.showEq];
+      case 'exit': return ['✕  Exit', false];
+      case 'xtoggle': { const k = STEPS[SIM.step].toggle; return k ? [`${TOGGLE_NAMES[k]}: ${onOff(p[k])}`, p[k]] : ['', false]; }
+      default: return ['?', false];
+    }
+  },
+  tick: function () {
+    const a = this.data.action;
+    let on = panelActive(this.el), vis = true;
+    if (a === 'prev') vis = SIM.step > 0;
+    if (a === 'replay') vis = !STEPS[SIM.step].keep;
+    if (a === 'xtoggle') vis = SIM.mode === 'explain' && !!STEPS[SIM.step].toggle;
+    on = on && vis;
+    setClickable(this.el, on);
+    this.el.object3D.visible = vis;
+    const [label, active] = this.state();
+    const key = label + active + this.hover;
+    if (key === this.drawn) return;
+    this.drawn = key;
+    const c = this.c.ctx, W = this.W;
+    c.clearRect(0, 0, W, 124);
+    c.fillStyle = active ? (this.hover ? '#c76a2c' : '#9c4f1f') : (this.hover ? '#2c3e55' : '#1b2738');
+    roundRect(c, 4, 4, W - 8, 116, 22); c.fill();
+    c.strokeStyle = this.hover ? '#ffd166' : 'rgba(143,163,191,0.4)'; c.lineWidth = 4;
+    roundRect(c, 4, 4, W - 8, 116, 22); c.stroke();
+    c.fillStyle = COL.text; c.font = `600 32px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(label, W / 2, 64);
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Main readout: clock, area, head-fire speed, wind compass and legend ----------
+function moistureWord(M) {
+  return M >= 25 ? 'too wet to burn' : M < 5 ? 'extremely dry' : M < 8 ? 'very dry' : M < 12 ? 'dry' : M < 18 ? 'damp' : 'wet';
+}
+function drawCompass(c, cx, cy, r) {
+  const p = SIM.params, w = windToward();
+  c.strokeStyle = 'rgba(143,163,191,0.6)'; c.lineWidth = 3;
+  c.beginPath(); c.arc(cx, cy, r, 0, 2 * Math.PI); c.stroke();
+  c.font = `700 24px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+  [['N', 0, -1], ['E', 1, 0], ['S', 0, 1], ['W', -1, 0]].forEach(([t, x, y]) => {
+    c.fillStyle = t === 'N' ? '#ffd166' : COL.muted; c.fillText(t, cx + x * (r + 20), cy + y * (r + 20));
+  });
+  if (p.windSpeed < 1) { c.fillStyle = COL.muted; c.font = `600 26px ${FONT}`; c.fillText('calm', cx, cy); return; }
+  // arrow points the way the wind blows (screen y is south)
+  const ax = w[0], ay = w[1], L0 = r * 0.8;
+  c.strokeStyle = COL.wind; c.fillStyle = COL.wind; c.lineWidth = 8;
+  c.beginPath(); c.moveTo(cx - ax * L0, cy - ay * L0); c.lineTo(cx + ax * (L0 - 18), cy + ay * (L0 - 18)); c.stroke();
+  const hx = cx + ax * L0, hy = cy + ay * L0, px = -ay, py = ax;
+  c.beginPath(); c.moveTo(hx, hy); c.lineTo(hx - ax * 30 + px * 16, hy - ay * 30 + py * 16);
+  c.lineTo(hx - ax * 30 - px * 16, hy - ay * 30 - py * 16); c.closePath(); c.fill();
+}
+AFRAME.registerComponent('info-display', {
+  init: function () {
+    this.c = makeCanvasPlane(0.66, 640, 427);
+    this.el.object3D.add(this.c.mesh);
+    this.last = 0;
+  },
+  tick: function (t) {
+    if (SIM.mode !== 'main' || t - this.last < 150) return;
+    this.last = t;
+    const c = this.c.ctx, st = stats(), p = SIM.params;
+    c.clearRect(0, 0, 640, 427);
+    c.fillStyle = COL.panel; roundRect(c, 0, 0, 640, 427, 24); c.fill();
+    c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+    c.fillStyle = COL.muted; c.font = `600 22px ${FONT}`; c.fillText('BUSHFIRE SPREAD', 24, 40);
+    c.fillStyle = COL.text;
+    if (SIM.started) {
+      c.font = `700 40px ${FONT}`; c.fillText(fmtTime(st.elapsed), 24, 90);
+      c.fillStyle = COL.muted; c.font = `22px ${FONT}`; c.fillText(p.paused ? 'paused' : 'since the first fire started', 24, 118);
+    } else {
+      c.font = `700 30px ${FONT}`; c.fillText('Ready', 24, 86);
+      c.fillStyle = COL.muted; c.font = `22px ${FONT}`;
+      c.fillText('Pick “Start fire” and point at the land', 24, 116);
+    }
+    const rows = [['Area burnt', `${st.areaHa < 10 ? st.areaHa.toFixed(1) : Math.round(st.areaHa)} ha`],
+                  ['Head-fire speed', SIM.started ? `${st.headKmh.toFixed(1)} km/h` : '–'],
+                  ['Fuel moisture', `${p.moisture.toFixed(1)}%`]];
+    if (p.spotting) rows.push(['Spot fires', String(st.spots)]);
+    rows.forEach(([k, v], i) => {
+      const y = 168 + i * 44;
+      c.fillStyle = COL.muted; c.font = `25px ${FONT}`; c.textAlign = 'left'; c.fillText(k, 24, y);
+      c.fillStyle = COL.text; c.font = `700 27px ${FONT}`; c.textAlign = 'right'; c.fillText(v, 405, y);
+    });
+    c.textAlign = 'left'; c.fillStyle = '#cfa96b'; c.font = `22px ${FONT}`;
+    c.fillText(`(${moistureWord(p.moisture)})`, 220, 168 + 2 * 44 + 26);
+    drawCompass(c, 527, 150, 70);
+    c.textAlign = 'center'; c.fillStyle = COL.text; c.font = `700 25px ${FONT}`;
+    c.fillText(p.windSpeed < 1 ? 'No wind' : `${Math.round(p.windSpeed)} km/h`, 527, 272);
+    c.fillStyle = COL.muted; c.font = `22px ${FONT}`;
+    if (p.windSpeed >= 1) c.fillText(`from the ${compassName(p.windDir)}`, 527, 300);
+    // legend
+    c.textAlign = 'left'; c.textBaseline = 'middle';
+    if (p.timeMap && SIM.started) {
+      const x0 = 24, x1 = 616, y = 372;
+      const g = c.createLinearGradient(x0, 0, x1, 0);
+      ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725'].forEach((h, k) => g.addColorStop(k / 4, h));
+      c.fillStyle = g; c.fillRect(x0, y - 12, x1 - x0, 24);
+      c.fillStyle = COL.muted; c.font = `21px ${FONT}`;
+      c.fillText('first burnt', x0, y + 32); c.textAlign = 'right'; c.fillText('most recent', x1, y + 32);
+      c.textAlign = 'center'; c.fillText('lines every 10 min', (x0 + x1) / 2, y + 32);
+    } else {
+      const items = [['Grass', '#c9a65a'], ['Forest', '#4d6b39'], ['Bare', '#b09372'], ['Burning', '#ff7a2a'], ['Burnt', '#2a2725']];
+      let x = 24;
+      c.font = `22px ${FONT}`;
+      items.forEach(([n, h]) => {
+        c.fillStyle = h; roundRect(c, x, 360, 24, 24, 5); c.fill();
+        c.strokeStyle = 'rgba(255,255,255,0.25)'; c.lineWidth = 1.5; c.stroke();
+        c.fillStyle = COL.text; c.fillText(n, x + 32, 373); x += 32 + c.measureText(n).width + 24;
+      });
+    }
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Tools panel hint ----------
+AFRAME.registerComponent('tool-hint', {
+  init: function () {
+    this.c = makeCanvasPlane(0.68, 680, 300);
+    this.el.object3D.add(this.c.mesh);
+    this.drawn = '';
+  },
+  tick: function () {
+    const vr = this.el.sceneEl.is('vr-mode'), v = SIM.view.mode;
+    const ctl = vr ? (v === 'table' ? 'Right thumbstick: turn and zoom the map. Left thumbstick: slide it.'
+                                    : 'Right thumbstick: turn. You are standing in the landscape at full size.')
+                   : (v === 'table' ? 'Mouse: drag to look, WASD to move. Q / E turn the map, R / F or the wheel zoom, arrow keys slide it.'
+                                    : 'Drag to look around. Q / E turn.');
+    const key = SIM.tool + ctl;
+    if (key === this.drawn) return;
+    this.drawn = key;
+    const c = this.c.ctx;
+    c.clearRect(0, 0, 680, 300);
+    c.fillStyle = COL.panel; roundRect(c, 0, 0, 680, 300, 22); c.fill();
+    c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+    c.fillStyle = TOOLS[SIM.tool].color; c.font = `700 30px ${FONT}`; c.fillText(TOOLS[SIM.tool].label, 22, 46);
+    c.fillStyle = '#d5deea'; c.font = `25px ${FONT}`;
+    const l1 = wrapLines(c, TOOLS[SIM.tool].hint, 636);
+    l1.forEach((ln, k) => c.fillText(ln, 22, 88 + k * 33));
+    c.fillStyle = COL.muted; c.font = `22px ${FONT}`;
+    wrapLines(c, ctl, 636).forEach((ln, k) => c.fillText(ln, 22, 88 + l1.length * 33 + 16 + k * 29));
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Explainer text panel ----------
+AFRAME.registerComponent('explain-display', {
+  init: function () {
+    this.c = makeCanvasPlane(1.24, 1024, 600);
+    this.el.object3D.add(this.c.mesh);
+    this.last = 0;
+  },
+  tick: function (t) {
+    if (SIM.mode !== 'explain' || t - this.last < 150) return;
+    this.last = t;
+    const st = STEPS[SIM.step], c = this.c.ctx, s = stats(), p = SIM.params;
+    c.clearRect(0, 0, 1024, 600);
+    c.fillStyle = COL.panel; roundRect(c, 0, 0, 1024, 600, 28); c.fill();
+    c.textAlign = 'left'; c.textBaseline = 'alphabetic';
+    for (let i = 0; i < STEPS.length; i++) {
+      c.fillStyle = i === SIM.step ? '#ffd166' : i < SIM.step ? '#e07a3c' : '#2b3a4f';
+      c.beginPath(); c.arc(44 + i * 30, 44, 9, 0, 2 * Math.PI); c.fill();
+    }
+    c.fillStyle = COL.muted; c.font = `600 24px ${FONT}`;
+    c.fillText(`STEP ${SIM.step + 1} OF ${STEPS.length}`, 44 + STEPS.length * 30 + 16, 53);
+    c.fillStyle = COL.text; c.font = `700 48px ${FONT}`; c.fillText(st.title, 40, 122);
+    c.font = `30px ${FONT}`; c.fillStyle = '#d5deea';
+    const lines = wrapLines(c, st.text, 944);
+    lines.forEach((ln, k) => c.fillText(ln, 40, 174 + k * 40));
+    let y = 174 + lines.length * 40 + 6;
+    if (SIM.showEq) {
+      c.font = `600 26px ${FONT}`;
+      const el = wrapLines(c, st.eq, 920);
+      c.fillStyle = '#16233a'; roundRect(c, 32, y - 8, 960, 22 + el.length * 34, 14); c.fill();
+      c.fillStyle = '#ffd166'; el.forEach((ln, k) => c.fillText(ln, 50, y + 24 + k * 34));
+    }
+    // live status line
+    c.fillStyle = '#16233a'; roundRect(c, 24, 534, 976, 50, 14); c.fill();
+    c.font = `600 26px ${FONT}`; c.fillStyle = COL.text;
+    const wind = p.windSpeed < 1 ? 'No wind' : `Wind ${Math.round(p.windSpeed)} km/h from ${compassName(p.windDir)}`;
+    const parts = SIM.started ? [fmtTime(s.elapsed), `${Math.round(s.areaHa)} ha burnt`, `head fire ${s.headKmh.toFixed(1)} km/h`, wind]
+                              : ['Starting…', wind];
+    if (SIM.started && p.spotting) parts.splice(3, 0, `${s.spots} spot fires`);
+    c.fillText(parts.join('   ·   '), 44, 568);
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Step title floating above the map in explainer mode ----------
+AFRAME.registerComponent('explain-title', {
+  init: function () {
+    this.sp = makeLabelSprite('', '#ffffff', 2.0, 60);
+    this.el.object3D.add(this.sp);
+  },
+  tick: function () {
+    this.sp.visible = SIM.mode === 'explain' && SIM.view.mode === 'table';
+    if (this.sp.visible) this.sp.setText(STEPS[SIM.step].title);
+  }
+});
+
+// ---------- In VR, raise or lower the panels to match the viewer's actual eye height ----------
+AFRAME.registerComponent('auto-height', {
+  schema: { target: { type: 'selector' } },
+  init: function () {
+    const v = new THREE.Vector3();
+    this.el.addEventListener('enter-vr', () => {
+      setTimeout(() => {
+        this.el.camera.el.object3D.getWorldPosition(v);
+        if (v.y > 0.4) this.data.target.object3D.position.y = v.y - 1.6;
+      }, 1000);
+    });
+    this.el.addEventListener('exit-vr', () => { this.data.target.object3D.position.y = 0; });
+  }
+});
+
+
+    </script>
+  </head>
+  <body>
+    <!--
+      BUSHFIRE SPREAD in VR
+      Desktop: drag to look around, WASD to move, click buttons and drag sliders; click the land to use a tool.
+      Q / E turn the map, R / F or the mouse wheel zoom, arrow keys slide it.
+      Quest: open in the browser, press the VR button. Point with either controller and pull the trigger
+      to use buttons, sliders and tools. Right thumbstick turns and zooms the map, left thumbstick slides it.
+    -->
+    <a-scene background="color: #0b0f16"
+             light="defaultLightsEnabled: false"
+             renderer="antialias: true; colorManagement: true; foveationLevel: 1"
+             cursor="rayOrigin: mouse; fuse: false"
+             raycaster="objects: .clickable; far: 20"
+             sim-runner sky-dome terrain-tools auto-height="target: #stage">
+
+      <a-entity floor-disc></a-entity>
+
+      <!-- Everything in #stage is shifted up or down in VR to match your eye height -->
+      <a-entity id="stage">
+
+        <!-- The landscape: a tabletop model, or full size when you "stand here" -->
+        <a-entity id="world" fire-world></a-entity>
+        <a-entity explain-title position="0 1.75 -1.9"></a-entity>
+
+        <!-- Tools panel (left) -->
+        <a-entity id="tools" position="-0.95 1.0 -0.6" rotation="-35 38 0">
+          <a-entity grab-move="target: #tools; label: Grab here to move panel; width: 0.5" position="0 0.37 0.002"></a-entity>
+          <a-plane width="0.76" height="0.64" position="0 0.02 -0.004" material="shader: flat; color: #3a2a1f"></a-plane>
+          <a-plane width="0.74" height="0.62" position="0 0.02 -0.002" material="shader: flat; color: #0b1320"></a-plane>
+          <a-entity ui-button="action: tool:ignite; width: 0.31" position="-0.165 0.26 0.002"></a-entity>
+          <a-entity ui-button="action: tool:stand; width: 0.31" position="0.165 0.26 0.002"></a-entity>
+          <a-entity ui-button="action: tool:raise; width: 0.31" position="-0.165 0.17 0.002"></a-entity>
+          <a-entity ui-button="action: tool:lower; width: 0.31" position="0.165 0.17 0.002"></a-entity>
+          <a-entity ui-button="action: tool:break; width: 0.31" position="-0.165 0.08 0.002"></a-entity>
+          <a-entity ui-button="action: tool:forest; width: 0.31" position="0.165 0.08 0.002"></a-entity>
+          <a-entity tool-hint position="0 -0.13 0.001"></a-entity>
+        </a-entity>
+
+        <!-- Main control panel (right) -->
+        <a-entity id="panel" mode-visible="mode: main" position="0.95 1.0 -0.6" rotation="-35 -38 0">
+          <a-entity grab-move="target: #panel; label: Grab here to move panel; width: 0.6" position="0 0.46 0.002"></a-entity>
+          <a-plane width="1.48" height="0.82" position="0 0.03 -0.004" material="shader: flat; color: #3a2a1f"></a-plane>
+          <a-plane width="1.46" height="0.80" position="0 0.03 -0.002" material="shader: flat; color: #0b1320"></a-plane>
+
+          <a-entity info-display position="-0.36 0.17 0.001"></a-entity>
+          <a-entity ui-button="action: terrain; width: 0.31" position="-0.525 -0.13 0.002"></a-entity>
+          <a-entity ui-button="action: fuel; width: 0.31" position="-0.195 -0.13 0.002"></a-entity>
+          <a-entity ui-button="action: slope; width: 0.31" position="-0.525 -0.22 0.002"></a-entity>
+          <a-entity ui-button="action: spotting; width: 0.31" position="-0.195 -0.22 0.002"></a-entity>
+          <a-entity ui-button="action: windchange; width: 0.31" position="-0.525 -0.31 0.002"></a-entity>
+          <a-entity ui-button="action: timemap; width: 0.31" position="-0.195 -0.31 0.002"></a-entity>
+
+          <a-entity ui-slider="key: windSpeed; min: 0; max: 80; step: 1; decimals: 0; label: Wind speed; unit: km/h"
+                    position="0.36 0.36 0.002"></a-entity>
+          <a-entity ui-slider="key: windDir; min: 0; max: 355; step: 5; decimals: 0; label: Wind from"
+                    position="0.36 0.27 0.002"></a-entity>
+          <a-entity ui-slider="key: moisture; min: 2; max: 25; step: 0.5; decimals: 1; label: Fuel moisture; unit: %"
+                    position="0.36 0.18 0.002"></a-entity>
+          <a-entity ui-slider="key: speed; min: 0.5; max: 20; step: 0.5; decimals: 1; label: Simulation speed; unit: min/s"
+                    position="0.36 0.09 0.002"></a-entity>
+
+          <a-entity ui-button="action: night" position="0.215 -0.04 0.002"></a-entity>
+          <a-entity ui-button="action: streaks" position="0.505 -0.04 0.002"></a-entity>
+          <a-entity ui-button="action: pause" position="0.215 -0.13 0.002"></a-entity>
+          <a-entity ui-button="action: resetfire" position="0.505 -0.13 0.002"></a-entity>
+          <a-entity ui-button="action: view; width: 0.56" position="0.36 -0.22 0.002"></a-entity>
+          <a-entity ui-button="action: explain; width: 0.56" position="0.36 -0.31 0.002"></a-entity>
+        </a-entity>
+
+        <!-- Explainer panel (shown only in explainer mode) -->
+        <a-entity id="explainer" mode-visible="mode: explain" position="0.95 1.0 -0.6" rotation="-35 -38 0">
+          <a-entity grab-move="target: #explainer; label: Grab here to move panel; width: 0.6" position="0 0.58 0.002"></a-entity>
+          <a-plane width="1.34" height="1.06" position="0 0.03 -0.004" material="shader: flat; color: #3a2a1f"></a-plane>
+          <a-plane width="1.32" height="1.04" position="0 0.03 -0.002" material="shader: flat; color: #0b1320"></a-plane>
+
+          <a-entity explain-display position="0 0.16 0.001"></a-entity>
+
+          <a-entity ui-slider="dynamic: true; key: moisture; min: 2; max: 25; label: Slider; width: 0.74"
+                    position="-0.2 -0.31 0.002"></a-entity>
+          <a-entity ui-button="action: xtoggle; width: 0.34" position="0.44 -0.31 0.002"></a-entity>
+
+          <a-entity ui-button="action: prev; width: 0.23" position="-0.5 -0.42 0.002"></a-entity>
+          <a-entity ui-button="action: next; width: 0.23" position="-0.25 -0.42 0.002"></a-entity>
+          <a-entity ui-button="action: replay; width: 0.23" position="0 -0.42 0.002"></a-entity>
+          <a-entity ui-button="action: eq; width: 0.23" position="0.25 -0.42 0.002"></a-entity>
+          <a-entity ui-button="action: exit; width: 0.23" position="0.5 -0.42 0.002"></a-entity>
+        </a-entity>
+
+      </a-entity>
+
+      <!-- Camera and Quest controllers (laser pointers) -->
+      <a-entity id="rig">
+        <a-entity camera="near: 0.05; far: 20000" look-controls wasd-controls position="0 1.6 0"></a-entity>
+        <a-entity id="handL" laser-controls="hand: left" raycaster="objects: .clickable; far: 8; lineColor: #ffcf9f; lineOpacity: 0.7"></a-entity>
+        <a-entity id="handR" laser-controls="hand: right" raycaster="objects: .clickable; far: 8; lineColor: #ffcf9f; lineOpacity: 0.7"></a-entity>
+      </a-entity>
+    </a-scene>
+  </body>
+</html>

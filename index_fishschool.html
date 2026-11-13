@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Fish School in 3D (VR)</title>
+    <script src="https://aframe.io/releases/1.7.0/aframe.min.js"></script>
+    <script>
+// ===================== MODEL (no graphics) =====================
+// 3D agent-based fish school. The same three rules as the 2D flocking app
+// (separation, alignment, cohesion), now in metres and seconds:
+//   Separation: for each neighbour inside personal space Rs, a unit push away scaled by (1 - d/Rs)
+//   Alignment:  (mean neighbour velocity - own velocity) / v0
+//   Cohesion:   (centre of neighbours - own position) / R
+//   a = gain * v0 * (ws*Fsep + wa*Fali + wc*Fcoh), capped at aMax * v0, plus a pull back to cruising speed.
+// Fish see neighbours for alignment and cohesion only outside a blind cone behind them;
+// very close neighbours (separation) are sensed all round, as with the lateral line.
+// The ocean wraps around horizontally in a 22 m square centred on the viewer, so there are no
+// side walls for schools to bump into; the seam sits deep in the haze where it cannot be seen.
+// Vertically, fish stay between the seabed and the surface and prefer to swim level.
+const FIX = {
+  BL: 0.2,            // body length (m)
+  v0: 0.6,            // cruising speed (m/s) = 3 body lengths per second
+  gain: 1.5,          // social forces -> acceleration (1/s, times v0)
+  aMax: 2.0,          // default turning limit (1/s, times v0) = largest turning rate in rad/s; p.turn overrides it
+  relax: 2.0,         // return to cruising speed (1/s)
+  noise: 0.3,         // random turning (1/s, times v0): fish are not perfect rule-followers
+  pitch: 0.8,         // damping of vertical swimming (1/s): fish prefer to swim level
+  fearR: 2.6,         // a threat within this distance alarms a fish (m)
+  escape: 3,          // escape acceleration, multiple of aMax
+  predSpeed: 1.0,     // predator top speed (m/s)
+  predAcc: 0.9,       // predator acceleration limit (m/s2)
+  huntRange: 6, catchR: 0.25, handling: 3.0, retarget: 1.5,
+  L: 22,              // horizontal size of the wrapping ocean (m)
+  yLo: 0.9, yHi: 4.4, // preferred depth band (heights above the seabed, m)
+  wall: 3.0,          // strength of the soft push back into the depth band (1/s, times v0)
+  bodyR: 0.75,        // fish keep this far from the viewer's body (m)
+  dt: 1 / 30          // model time step (s)
+};
+
+function Model(p) {
+  this.p = p;               // live parameters: sep, ali, coh, R, Rsep, blind
+  this.n = 0; this.cap = 0;
+  this.preds = []; this.scares = []; this.threats = []; this.hands = [];
+  this.viewer = { x: 0, y: 1.6, z: 0, on: true };
+  this.catches = 0; this.t = 0;
+  this.polar = 0; this.mill = 0; this.local = 0; this.main = 0; this.groups = 0;
+  this.hist = []; this.histT = -1;
+  this.acc = new Float32Array(3); this._env = new Float32Array(3);
+  this._grow(1024);
+}
+
+Model.prototype._grow = function (cap) {
+  const names = ['x', 'y', 'z', 'vx', 'vy', 'vz', 'ax', 'ay', 'az', 'px', 'py', 'pz', 'fear', 'loc'];
+  for (const k of names) {
+    const a = new Float32Array(cap);
+    if (this[k]) a.set(this[k].subarray(0, this.n));
+    this[k] = a;
+  }
+  const nb = new Uint16Array(cap); if (this.nb) nb.set(this.nb.subarray(0, this.n)); this.nb = nb;
+  this.cellOf = new Int32Array(cap); this.cellIdx = new Int32Array(cap);
+  this.S = new Float32Array(cap * 6); this.slot = new Int32Array(cap);
+  this.cap = cap;
+};
+
+// Minimum-image horizontal separation in the wrapping ocean
+Model.prototype.wrapD = function (d) { const L = FIX.L; return d > L / 2 ? d - L : d < -L / 2 ? d + L : d; };
+
+// A random spot; far = only in the distant haze (so new fish swim in rather than pop up nearby)
+Model.prototype._randomPoint = function (far) {
+  const L = FIX.L, V = this.viewer;
+  for (let k = 0; k < 60; k++) {
+    const dx = (Math.random() - 0.5) * L, dz = (Math.random() - 0.5) * L, r = Math.hypot(dx, dz);
+    if (r < (far ? 8 : 2.5)) continue;
+    return [V.x + dx, FIX.yLo + Math.random() * (FIX.yHi - FIX.yLo), V.z + dz];
+  }
+  return [V.x + L * 0.45, 2.5, V.z];
+};
+
+Model.prototype.addFish = function (far) {
+  if (this.n >= this.cap) this._grow(this.cap * 2);
+  const i = this.n++, P = this._randomPoint(far);
+  const a = Math.random() * Math.PI * 2, e = (Math.random() - 0.5) * 0.3, v = FIX.v0;
+  this.x[i] = this.px[i] = P[0]; this.y[i] = this.py[i] = P[1]; this.z[i] = this.pz[i] = P[2];
+  this.vx[i] = v * Math.cos(e) * Math.cos(a); this.vy[i] = v * Math.sin(e); this.vz[i] = v * Math.cos(e) * Math.sin(a);
+  this.fear[i] = 0; this.nb[i] = 0; this.loc[i] = 0;
+};
+
+Model.prototype.setCount = function (n) {
+  while (this.n < n) this.addFish(this.t > 0);
+  if (this.n > n) this.n = n;
+  for (const pr of this.preds) if (pr.target >= this.n) pr.target = -1;
+};
+
+Model.prototype._newPred = function () {
+  const P = this._randomPoint(true), a = Math.random() * Math.PI * 2;
+  return { x: P[0], y: P[1], z: P[2], px: P[0], py: P[1], pz: P[2],
+           vx: Math.cos(a) * 0.5, vy: 0, vz: Math.sin(a) * 0.5,
+           target: -1, retarget: 0, handle: 0, wa: a };
+};
+
+Model.prototype.setPredators = function (k) {
+  while (this.preds.length < k) this.preds.push(this._newPred());
+  this.preds.length = k;
+};
+
+// New random positions, scattered all around (some close, most further away)
+Model.prototype.scatter = function () {
+  const n = this.n; this.n = 0; this.t = 0;
+  for (let i = 0; i < n; i++) this.addFish(false);
+  for (let k = 0; k < this.preds.length; k++) this.preds[k] = this._newPred();
+  this.catches = 0; this.hist = []; this.histT = -1; this.scares = [];
+};
+
+Model.prototype.scare = function (x, y, z) { this.scares.push({ x, y, z, life: 1.3 }); };
+
+// Keep every fish inside the square of side L centred on the viewer (horizontal wrap)
+Model.prototype._wrapAll = function () {
+  const L = FIX.L, V = this.viewer, x0 = V.x - L / 2, z0 = V.z - L / 2;
+  const wrap = (o, k, lo) => {
+    const v = o[k];
+    if (v < lo) { o[k] = v + L; return L; }
+    if (v >= lo + L) { o[k] = v - L; return -L; }
+    return 0;
+  };
+  for (let i = 0; i < this.n; i++) {
+    let s = 0;
+    if (this.x[i] < x0) s = L; else if (this.x[i] >= x0 + L) s = -L;
+    if (s) { this.x[i] += s; this.px[i] += s; }
+    s = 0;
+    if (this.z[i] < z0) s = L; else if (this.z[i] >= z0 + L) s = -L;
+    if (s) { this.z[i] += s; this.pz[i] += s; }
+  }
+  for (const pr of this.preds) {
+    const sx = wrap(pr, 'x', x0); pr.px += sx;
+    const sz = wrap(pr, 'z', z0); pr.pz += sz;
+  }
+};
+
+// Uniform 3D grid, cells at least R wide, periodic horizontally: all neighbours lie in the 3x3x3 block
+Model.prototype.buildGrid = function () {
+  const R = Math.max(this.p.R, LINK), L = FIX.L, V = this.viewer;   // cells also serve the school finder
+  this.gx0 = V.x - L / 2; this.gz0 = V.z - L / 2; this.gy0 = -0.5;
+  const Ly = 7.5;
+  const nx = Math.max(3, Math.floor(L / R)), ny = Math.max(1, Math.floor(Ly / R)), nz = nx;
+  const nc = nx * ny * nz;
+  if (!this.cellStart || this.cellStart.length !== nc + 1) { this.cellStart = new Int32Array(nc + 1); this.cellFill = new Int32Array(nc); }
+  this.nx = nx; this.ny = ny; this.nz = nz;
+  this.cwx = L / nx; this.cwy = Ly / ny; this.cwz = L / nz;
+  const start = this.cellStart, fill = this.cellFill;
+  start.fill(0);
+  for (let i = 0; i < this.n; i++) {
+    const c = this._cell(this.x[i], this.y[i], this.z[i]);
+    this.cellOf[i] = c; start[c + 1]++;
+  }
+  for (let k = 0; k < nc; k++) start[k + 1] += start[k];
+  for (let k = 0; k < nc; k++) fill[k] = start[k];
+  for (let i = 0; i < this.n; i++) this.cellIdx[fill[this.cellOf[i]]++] = i;
+  // Copies of positions and velocities in cell order, so the neighbour loop reads memory in sequence
+  const S = this.S, idx = this.cellIdx;
+  for (let m = 0; m < this.n; m++) {
+    const j = idx[m], o = m * 6;
+    S[o] = this.x[j]; S[o + 1] = this.y[j]; S[o + 2] = this.z[j];
+    S[o + 3] = this.vx[j]; S[o + 4] = this.vy[j]; S[o + 5] = this.vz[j];
+    this.slot[j] = m;
+  }
+};
+
+Model.prototype._ci = function (v, v0, w, n) { const c = Math.floor((v - v0) / w); return c < 0 ? 0 : c >= n ? n - 1 : c; };
+Model.prototype._cell = function (x, y, z) {
+  return (this._ci(z, this.gz0, this.cwz, this.nz) * this.ny + this._ci(y, this.gy0, this.cwy, this.ny)) * this.nx
+       + this._ci(x, this.gx0, this.cwx, this.nx);
+};
+
+// Steering acceleration from the three social rules for fish i (written into this.acc)
+Model.prototype.social = function (i) {
+  const p = this.p, L = FIX.L, hL = L / 2;
+  const R = p.R, R2 = R * R, Rs = Math.min(p.Rsep, R), Rs2 = Rs * Rs;
+  const cosBlind = Math.cos(Math.PI - p.blind * Math.PI / 360);   // blind = full width of the blind cone (degrees)
+  const useBlind = p.blind > 0.5;
+  const xi = this.x[i], yi = this.y[i], zi = this.z[i], vxi = this.vx[i], vyi = this.vy[i], vzi = this.vz[i];
+  const si = Math.sqrt(vxi * vxi + vyi * vyi + vzi * vzi) || 1;
+  let n = 0, svx = 0, svy = 0, svz = 0, sdx = 0, sdy = 0, sdz = 0, sx = 0, sy = 0, sz = 0;
+  const nx = this.nx, ny = this.ny, nz = this.nz;
+  const c = this.cellOf[i], cx = c % nx, cy = Math.floor(c / nx) % ny, cz = Math.floor(c / (nx * ny));
+  const start = this.cellStart, S = this.S, me = this.slot[i];
+  const y0 = Math.max(0, cy - 1), y1 = Math.min(ny - 1, cy + 1);
+  for (let dzc = -1; dzc <= 1; dzc++) {
+    const kz = (cz + dzc + nz) % nz;
+    for (let ky = y0; ky <= y1; ky++) {
+      const row = (kz * ny + ky) * nx;
+      for (let dxc = -1; dxc <= 1; dxc++) {
+        const cc = row + (cx + dxc + nx) % nx, end = start[cc + 1];
+        for (let m = start[cc]; m < end; m++) {
+          if (m === me) continue;
+          const o = m * 6;
+          let dx = S[o] - xi, dz = S[o + 2] - zi;
+          if (dx > hL) dx -= L; else if (dx < -hL) dx += L;
+          if (dz > hL) dz -= L; else if (dz < -hL) dz += L;
+          const dy = S[o + 1] - yi, d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 >= R2) continue;
+          if (d2 < Rs2 && d2 > 1e-12) {
+            const d = Math.sqrt(d2), w = (1 - d / Rs) / d;
+            sx -= dx * w; sy -= dy * w; sz -= dz * w;
+          }
+          if (useBlind && (dx * vxi + dy * vyi + dz * vzi) < cosBlind * si * Math.sqrt(d2)) continue;  // behind: not seen
+          n++; svx += S[o + 3]; svy += S[o + 4]; svz += S[o + 5]; sdx += dx; sdy += dy; sdz += dz;
+        }
+      }
+    }
+  }
+  this.nb[i] = n;
+  // local alignment: cosine between own heading and the mean heading of the fish it sees
+  const vm = Math.sqrt(svx * svx + svy * svy + svz * svz);
+  this.loc[i] = n > 0 && vm > 1e-9 ? (svx * vxi + svy * vyi + svz * vzi) / (vm * si) : 0;
+  const v0 = FIX.v0, a = this.acc;
+  let ax = p.sep * sx, ay = p.sep * sy, az = p.sep * sz;
+  if (n > 0) {
+    ax += p.ali * (svx / n - vxi) / v0 + p.coh * (sdx / n) / R;
+    ay += p.ali * (svy / n - vyi) / v0 + p.coh * (sdy / n) / R;
+    az += p.ali * (svz / n - vzi) / v0 + p.coh * (sdz / n) / R;
+  }
+  const g = FIX.gain * v0; ax *= g; ay *= g; az *= g;
+  const f = Math.sqrt(ax * ax + ay * ay + az * az), mf = (p.turn || FIX.aMax) * v0;
+  if (f > mf) { ax *= mf / f; ay *= mf / f; az *= mf / f; }
+  a[0] = ax; a[1] = ay; a[2] = az;
+  return a;
+};
+
+// Depth band, level swimming and the viewer's body
+Model.prototype.environment = function (x, y, z, vy, out) {
+  const v0 = FIX.v0, k = FIX.wall * v0;
+  let ay = -FIX.pitch * vy;
+  if (y < FIX.yLo) ay += k * (FIX.yLo - y) * 2;
+  if (y > FIX.yHi) ay -= k * (y - FIX.yHi) * 2;
+  let ax = 0, az = 0;
+  const V = this.viewer;
+  if (V.on) {   // the viewer's body: a vertical segment from the floor to just above the head
+    const hy = Math.max(0.2, Math.min(V.y + 0.15, y));
+    const dx = this.wrapD(x - V.x), dy = y - hy, dz = this.wrapD(z - V.z);
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz), r = FIX.bodyR;
+    if (d < r && d > 1e-6) {
+      const s = 10 * v0 * (1 - d / r) / d;
+      ax += s * dx; ay += s * dy; az += s * dz;
+    }
+  }
+  out[0] = ax; out[1] = ay; out[2] = az;
+  return out;
+};
+
+Model.prototype.step = function () {
+  const dt = FIX.dt, n = this.n, v0 = FIX.v0, env = this._env;
+  this._wrapAll();
+  this.buildGrid();
+  const src = this.threats;          // predators, startle points and gripping hands
+  src.length = 0;
+  for (const pr of this.preds) src.push(pr);
+  for (const s of this.scares) src.push(s);
+  for (const h of this.hands) if (h.on) src.push(h);
+  const fearR = FIX.fearR, mf = FIX.aMax * v0, noise = (this.p.noise !== undefined ? this.p.noise : FIX.noise) * v0 * 1.7;
+  const x = this.x, y = this.y, z = this.z, vx = this.vx, vy = this.vy, vz = this.vz;
+
+  // 1. Every fish decides from the same snapshot
+  for (let i = 0; i < n; i++) {
+    const a = this.social(i);
+    let ax = a[0], ay = a[1], az = a[2];
+    const s = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]) || 1;
+    let u = 0, fx = 0, fy = 0, fz = 0;
+    for (let k = 0; k < src.length; k++) {
+      const dx = this.wrapD(x[i] - src[k].x), dy = y[i] - src[k].y, dz = this.wrapD(z[i] - src[k].z);
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d < fearR && d > 1e-6) { const w = 1 - d / fearR; fx += dx / d * w; fy += dy / d * w; fz += dz / d * w; if (w > u) u = w; }
+    }
+    const rel = FIX.relax * (v0 * (1 + 0.6 * u) - s);
+    ax += rel * vx[i] / s; ay += rel * vy[i] / s; az += rel * vz[i] / s;
+    if (u > 0) {   // alarmed: the social rules weaken and an escape force steers away from the threat
+      const fm = Math.sqrt(fx * fx + fy * fy + fz * fz) || 1, sp = v0 * (1 + 0.6 * u);
+      let ex = fx / fm * sp - vx[i], ey = fy / fm * sp - vy[i], ez = fz / fm * sp - vz[i];
+      const em = Math.sqrt(ex * ex + ey * ey + ez * ez), cap = mf * FIX.escape * u;
+      if (em > cap) { ex *= cap / em; ey *= cap / em; ez *= cap / em; }
+      ax = ax * (1 - 0.8 * u) + ex; ay = ay * (1 - 0.8 * u) + ey; az = az * (1 - 0.8 * u) + ez;
+    }
+    ax += (Math.random() - 0.5) * noise; ay += (Math.random() - 0.5) * noise * 0.5; az += (Math.random() - 0.5) * noise;
+    this.environment(x[i], y[i], z[i], vy[i], env);
+    this.ax[i] = ax + env[0]; this.ay[i] = ay + env[1]; this.az[i] = az + env[2];
+    this.fear[i] = u;
+  }
+  // 2. Then everyone moves
+  for (let i = 0; i < n; i++) {
+    let nvx = vx[i] + this.ax[i] * dt, nvy = vy[i] + this.ay[i] * dt, nvz = vz[i] + this.az[i] * dt;
+    const cap = v0 * (1.6 + 0.6 * this.fear[i]), s = Math.sqrt(nvx * nvx + nvy * nvy + nvz * nvz);
+    if (s > cap) { nvx *= cap / s; nvy *= cap / s; nvz *= cap / s; }
+    vx[i] = nvx; vy[i] = nvy; vz[i] = nvz;
+    this.px[i] = x[i]; this.py[i] = y[i]; this.pz[i] = z[i];
+    x[i] += nvx * dt; y[i] = Math.min(6.2, Math.max(0.12, y[i] + nvy * dt)); z[i] += nvz * dt;
+  }
+  for (const pr of this.preds) this._stepPred(pr);
+  for (let k = this.scares.length - 1; k >= 0; k--) if ((this.scares[k].life -= dt) <= 0) this.scares.splice(k, 1);
+  this.t += dt;
+  if (this.t - this.histT >= 0.25) {
+    this.histT = this.t;
+    this.order();
+    this.hist.push([this.t, this.polar, this.mill, this.local]);
+    if (this.hist.length > 240) this.hist.shift();
+  }
+};
+
+// Order parameters (Couzin et al. 2002) for the largest school:
+//   polarisation P = |mean heading|; milling M = |mean of (r_hat x v_hat)| about the school's centre.
+// A school is a set of fish joined by links shorter than LINK (4 body lengths), found with union-find.
+const LINK = 0.8;
+Model.prototype._find = function (i) { const pa = this._par; while (pa[i] !== i) { pa[i] = pa[pa[i]]; i = pa[i]; } return i; };
+Model.prototype.order = function () {
+  const n = this.n; if (!n) { this.polar = this.mill = this.main = this.groups = 0; return; }
+  if (!this._par || this._par.length < this.cap) { this._par = new Int32Array(this.cap); this._sz = new Int32Array(this.cap); this._mem = new Int32Array(this.cap); }
+  const pa = this._par, sz = this._sz, L = FIX.L, hL = L / 2, L2 = LINK * LINK;
+  for (let i = 0; i < n; i++) { pa[i] = i; sz[i] = 0; }
+  const nx = this.nx, ny = this.ny, nz = this.nz, start = this.cellStart, idx = this.cellIdx;
+  for (let i = 0; i < n; i++) {
+    const c = this.cellOf[i], cx = c % nx, cy = Math.floor(c / nx) % ny, cz = Math.floor(c / (nx * ny));
+    for (let dzc = -1; dzc <= 1; dzc++) for (let ky = Math.max(0, cy - 1); ky <= Math.min(ny - 1, cy + 1); ky++) {
+      const row = (((cz + dzc + nz) % nz) * ny + ky) * nx;
+      for (let dxc = -1; dxc <= 1; dxc++) {
+        const cc = row + (cx + dxc + nx) % nx;
+        for (let m = start[cc]; m < start[cc + 1]; m++) {
+          const j = idx[m]; if (j <= i) continue;
+          let dx = this.x[j] - this.x[i], dz = this.z[j] - this.z[i];
+          if (dx > hL) dx -= L; else if (dx < -hL) dx += L;
+          if (dz > hL) dz -= L; else if (dz < -hL) dz += L;
+          const dy = this.y[j] - this.y[i];
+          if (dx * dx + dy * dy + dz * dz < L2) { const a = this._find(i), b = this._find(j); if (a !== b) pa[a] = b; }
+        }
+      }
+    }
+  }
+  let best = 0, groups = 0, alone = 0;
+  for (let i = 0; i < n; i++) sz[this._find(i)]++;
+  for (let i = 0; i < n; i++) if (pa[i] === i) {
+    if (sz[i] >= 10) groups++;
+    if (sz[i] < 3) alone += sz[i];
+    if (sz[i] > sz[best] || pa[best] !== best) best = i;
+  }
+  this.groups = groups; this.main = sz[best]; this.alone = alone;
+  // positions relative to one member (minimum image), then centre, heading and rotation
+  const mem = this._mem; let k = 0;
+  for (let i = 0; i < n; i++) if (this._find(i) === best) mem[k++] = i;
+  const ref = mem[0];
+  let cx = 0, cy = 0, cz = 0;
+  for (let q = 0; q < k; q++) { const i = mem[q]; cx += this.wrapD(this.x[i] - this.x[ref]); cy += this.y[i]; cz += this.wrapD(this.z[i] - this.z[ref]); }
+  cx /= k; cy /= k; cz /= k;
+  let hx = 0, hy = 0, hz = 0, mx = 0, my = 0, mz = 0, Lc = 0;
+  for (let q = 0; q < k; q++) {
+    const i = mem[q];
+    const s = Math.sqrt(this.vx[i] ** 2 + this.vy[i] ** 2 + this.vz[i] ** 2) || 1;
+    const ux = this.vx[i] / s, uy = this.vy[i] / s, uz = this.vz[i] / s;
+    hx += ux; hy += uy; hz += uz;
+    const rx = this.wrapD(this.x[i] - this.x[ref]) - cx, ry = this.y[i] - cy, rz = this.wrapD(this.z[i] - this.z[ref]) - cz;
+    const r = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1;
+    mx += (ry * uz - rz * uy) / r; my += (rz * ux - rx * uz) / r; mz += (rx * uy - ry * ux) / r;
+    Lc += this.loc[i];
+  }
+  this.polar = Math.sqrt(hx * hx + hy * hy + hz * hz) / k;
+  this.mill = Math.sqrt(mx * mx + my * my + mz * mz) / k;
+  this.local = Lc / k;
+  this.centre = [this.x[ref] + cx, cy, this.z[ref] + cz];
+};
+
+Model.prototype._chooseTarget = function (pr) {
+  let best = -1, bestScore = Infinity;
+  for (let i = 0; i < this.n; i++) {
+    const dx = this.wrapD(this.x[i] - pr.x), dy = this.y[i] - pr.y, dz = this.wrapD(this.z[i] - pr.z);
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (d > FIX.huntRange) continue;
+    const score = d - Math.max(0, 6 - this.nb[i]) * 0.6;    // isolated fish look closer
+    if (score < bestScore) { bestScore = score; best = i; }
+  }
+  return best;
+};
+
+Model.prototype._stepPred = function (pr) {
+  const dt = FIX.dt, env = this._env;
+  let cap = FIX.predSpeed, tx, ty, tz, hunting = false;
+  pr.px = pr.x; pr.py = pr.y; pr.pz = pr.z;
+  if (pr.handle > 0) pr.handle -= dt;
+  else {
+    if (pr.target >= this.n) pr.target = -1;
+    if (pr.target < 0 || (pr.retarget -= dt) <= 0) { pr.target = this._chooseTarget(pr); pr.retarget = FIX.retarget; }
+    if (pr.target >= 0) {
+      const i = pr.target, dx = this.wrapD(this.x[i] - pr.x), dy = this.y[i] - pr.y, dz = this.wrapD(this.z[i] - pr.z);
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d > FIX.huntRange * 1.3) pr.target = -1;
+      else if (d < FIX.catchR) this._catch(pr, i);
+      else {   // aim at where the target is heading
+        const look = Math.min(d / cap, 1.0);
+        tx = dx + this.vx[i] * look; ty = dy + this.vy[i] * look; tz = dz + this.vz[i] * look; hunting = true;
+      }
+    }
+  }
+  if (!hunting) {   // cruise slowly, wandering
+    cap = FIX.predSpeed * (pr.handle > 0 ? 0.4 : 0.55);
+    pr.wa += (Math.random() - 0.5) * 0.12;
+    tx = Math.cos(pr.wa); ty = 0; tz = Math.sin(pr.wa);
+  }
+  const m = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+  let ax = tx / m * cap - pr.vx, ay = ty / m * cap - pr.vy, az = tz / m * cap - pr.vz;
+  const am = Math.sqrt(ax * ax + ay * ay + az * az), lim = FIX.predAcc;
+  if (am > lim) { ax *= lim / am; ay *= lim / am; az *= lim / am; }
+  this.environment(pr.x, pr.y, pr.z, pr.vy, env);
+  pr.vx += (ax + env[0]) * dt; pr.vy += (ay + env[1]) * dt; pr.vz += (az + env[2]) * dt;
+  const s = Math.sqrt(pr.vx ** 2 + pr.vy ** 2 + pr.vz ** 2), top = FIX.predSpeed * 1.2;
+  if (s > top) { pr.vx *= top / s; pr.vy *= top / s; pr.vz *= top / s; }
+  if (hunting) pr.wa = Math.atan2(pr.vz, pr.vx);
+  pr.x += pr.vx * dt; pr.y = Math.min(5.5, Math.max(0.4, pr.y + pr.vy * dt)); pr.z += pr.vz * dt;
+};
+
+Model.prototype._catch = function (pr, i) {
+  this.catches++;
+  pr.handle = FIX.handling; pr.target = -1;
+  for (let tries = 0; tries < 20; tries++) {     // a replacement fish arrives from the distant haze
+    const P = this._randomPoint(true);
+    let ok = true;
+    for (const q of this.preds) if (this.wrapD(P[0] - q.x) ** 2 + this.wrapD(P[2] - q.z) ** 2 < 25) { ok = false; break; }
+    if (ok || tries === 19) {
+      const a = Math.random() * Math.PI * 2;
+      this.x[i] = this.px[i] = P[0]; this.y[i] = this.py[i] = P[1]; this.z[i] = this.pz[i] = P[2];
+      this.vx[i] = Math.cos(a) * FIX.v0; this.vy[i] = 0; this.vz[i] = Math.sin(a) * FIX.v0;
+      this.fear[i] = 0;
+      break;
+    }
+  }
+};
+// ===================== MODEL-END =====================
+
+
+// ===================== SETTINGS AND PRESETS =====================
+const P = { sep: 1.5, ali: 1.0, coh: 1.0, R: 1.0, Rsep: 0.6, blind: 60, turnDeg: 115, turn: 2.0,
+            n: 500, preds: 0, speed: 1, paused: false };
+const PRESETS = {
+  school: { sep: 1.5, ali: 1.0, coh: 1.0, R: 1.0, blind: 60, turnDeg: 115, preds: 0, name: 'School',
+            text: 'Balanced rules. Fish gather into several schools that each swim in one direction, and merge or split as they meet.' },
+  noali:  { sep: 1.5, ali: 0.0, coh: 1.0, R: 1.0, blind: 0, turnDeg: 115, preds: 0, name: 'No alignment',
+            text: 'Alignment switched off. Fish still clump together, and neighbours often end up heading roughly the same way anyway. Compare the neighbour alignment with School.' },
+  loners: { sep: 1.5, ali: 0.0, coh: 0.0, R: 1.0, blind: 60, turnDeg: 115, preds: 0, name: 'Loners',
+            text: 'No alignment and no cohesion. Fish only avoid bumping into each other: a baseline with no social behaviour.' },
+  mill:   { sep: 1.5, ali: 0.5, coh: 1.5, R: 2.0, blind: 140, turnDeg: 35, preds: 0, name: 'Mill around you',
+            text: 'Slow turning, a wide blind angle and long-range attraction. Fish restart scattered; within about half a minute the school wraps around you and circles. In this model the mill needs an obstacle (you) at its centre.' },
+  attack: { sep: 1.5, ali: 1.0, coh: 1.2, R: 1.1, blind: 60, turnDeg: 115, preds: 2, name: 'Under attack',
+            text: 'Two predators hunt, preferring fish with few neighbours. Watch schools split around a predator and then reform.' }
+};
+const SIM = { model: null, preset: 'school', acc: 0, stepMs: 0, fps: 72, mode: 'main', panel: true };
+const MAXN = 1000;
+
+function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+function applyPreset(key) {
+  const pr = PRESETS[key];
+  ['sep', 'ali', 'coh', 'R', 'blind', 'turnDeg', 'preds'].forEach(k => { P[k] = pr[k]; });
+  SIM.preset = key;
+}
+function startModel() {
+  const m = new Model(P);
+  m.setCount(P.n); m.setPredators(P.preds);
+  SIM.model = m;
+}
+
+// ===================== DRAWING HELPERS =====================
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+const COL = { text: '#e8eef6', muted: '#8fa3bf', panel: '#0d1726', P: '#ffd166', M: '#6fd3ff', L: '#7ee0a0', fear: '#ff7a5c' };
+
+// A flat plane carrying a 2D canvas, used for all text in the scene
+function makeCanvasPlane(widthM, pxW, pxH) {
+  const canvas = document.createElement('canvas');
+  canvas.width = pxW; canvas.height = pxH;
+  const ctx = canvas.getContext('2d');
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, fog: false });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(widthM, widthM * pxH / pxW), mat);
+  return { canvas, ctx, tex, mesh, mat };
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h);
+}
+function wrapLines(ctx, text, maxW) {
+  const words = text.split(' '), lines = []; let line = '';
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = w; } else line = test;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+function mulberry32(a) {
+  return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+
+// What the main school is doing, from its polarisation and milling (thresholds as in Couzin et al. 2002)
+function schoolState(m) {
+  if (m.main < 12) return ['No school', 'Fish swim on their own'];
+  if (m.polar > 0.65 && m.mill < 0.35) return ['Polarised school', 'Everyone heads the same way'];
+  if (m.mill > 0.5 && m.polar < 0.35) return ['Mill (torus)', 'Fish circle round an empty core'];
+  if (m.polar < 0.35 && m.mill < 0.35) return ['Swarm', 'Together, but no shared direction'];
+  return ['In between', 'Partly aligned, or turning as a group'];
+}
+
+// ===================== FISH GEOMETRY =====================
+// A low-poly fish, nose along +z, with countershading (dark back, silver belly) in vertex colours.
+function fishGeometry(len, back, belly, fin) {
+  const rings = [[0.50, 0, 0], [0.34, 0.06, 0.09], [0.12, 0.085, 0.15], [-0.12, 0.06, 0.11], [-0.30, 0.025, 0.045], [-0.36, 0.012, 0.022]];
+  const SEG = 8, pos = [], col = [];
+  const cB = new THREE.Color(back), cS = new THREE.Color(belly), cF = new THREE.Color(fin);
+  const vtx = (r, k) => {
+    const [z, w, h] = rings[r], a = k / SEG * Math.PI * 2;
+    return [Math.cos(a) * w * len, Math.sin(a) * h * len, z * len];
+  };
+  const shade = (y, hmax) => { const t = clamp(0.5 + 0.5 * y / (hmax || 1), 0, 1); return cS.clone().lerp(cB, t * t * (3 - 2 * t)); };
+  const push = (p, c) => { pos.push(p[0], p[1], p[2]); col.push(c.r, c.g, c.b); };
+  for (let r = 0; r < rings.length - 1; r++) for (let k = 0; k < SEG; k++) {
+    const a = vtx(r, k), b = vtx(r, k + 1), c = vtx(r + 1, k), d = vtx(r + 1, k + 1), hm = 0.15 * len;
+    push(a, shade(a[1], hm)); push(c, shade(c[1], hm)); push(b, shade(b[1], hm));
+    push(b, shade(b[1], hm)); push(c, shade(c[1], hm)); push(d, shade(d[1], hm));
+  }
+  const L = len, tri = (p, q, r) => { push(p, cF); push(q, cF); push(r, cF); };
+  // forked tail fin
+  tri([0, 0, -0.34 * L], [0, 0.20 * L, -0.56 * L], [0, 0.03 * L, -0.46 * L]);
+  tri([0, 0, -0.34 * L], [0, 0.03 * L, -0.46 * L], [0, -0.03 * L, -0.46 * L]);
+  tri([0, 0, -0.34 * L], [0, -0.03 * L, -0.46 * L], [0, -0.20 * L, -0.56 * L]);
+  // dorsal fin
+  tri([0, 0.13 * L, 0.10 * L], [0, 0.22 * L, -0.06 * L], [0, 0.08 * L, -0.16 * L]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
+// Instanced mesh whose tail beats in the vertex shader (one draw call for every fish)
+function swimmingMesh(geom, maxCount, len, freq, amp) {
+  const phase = new Float32Array(maxCount);
+  for (let i = 0; i < maxCount; i++) phase[i] = Math.random() * 6.283;
+  geom.setAttribute('aPhase', new THREE.InstancedBufferAttribute(phase, 1));
+  const uTime = { value: 0 };
+  const mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uTime = uTime;
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', `#include <common>
+        attribute float aPhase;
+        uniform float uTime;`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+        float tw = clamp((${(0.2 * len).toFixed(4)} - position.z) / ${(0.75 * len).toFixed(4)}, 0.0, 1.0);
+        transformed.x += sin(uTime * ${freq.toFixed(2)} + aPhase - position.z * ${(7 / len).toFixed(3)}) * ${(amp * len).toFixed(4)} * tw * tw;`);
+  };
+  const mesh = new THREE.InstancedMesh(geom, mat, maxCount);
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  mesh.frustumCulled = false;      // instances are spread all around the viewer
+  mesh.count = 0;
+  return { mesh, uTime };
+}
+
+// Writes a pose (position + heading) into an instance matrix: the fish's +z points along (vx, vy, vz)
+function writePose(arr, i, x, y, z, vx, vy, vz) {
+  let s = Math.sqrt(vx * vx + vy * vy + vz * vz) || 1;
+  const fx = vx / s, fy = vy / s, fz = vz / s;
+  let rx = fz, rz = -fx;                              // right = up x forward, with up = (0, 1, 0)
+  s = Math.sqrt(rx * rx + rz * rz) || 1; rx /= s; rz /= s;
+  const ux = fy * rz, uy = fz * rx - fx * rz, uz = -fy * rx;   // up' = forward x right
+  const o = i * 16;
+  arr[o] = rx; arr[o + 1] = 0; arr[o + 2] = rz; arr[o + 3] = 0;
+  arr[o + 4] = ux; arr[o + 5] = uy; arr[o + 6] = uz; arr[o + 7] = 0;
+  arr[o + 8] = fx; arr[o + 9] = fy; arr[o + 10] = fz; arr[o + 11] = 0;
+  arr[o + 12] = x; arr[o + 13] = y; arr[o + 14] = z; arr[o + 15] = 1;
+}
+
+// ===================== COMPONENTS =====================
+const _v = new THREE.Vector3();
+function toStage(obj, out) {      // world position of obj, in the coordinates of #stage (the model's frame)
+  obj.getWorldPosition(out);
+  return SIM.stage ? SIM.stage.worldToLocal(out) : out;
+}
+
+// Runs the model at a fixed 30 steps per second; drawing interpolates between steps
+AFRAME.registerComponent('sim-runner', {
+  init: function () {
+    applyPreset('school'); startModel();
+    SIM.stage = document.querySelector('#stage').object3D;
+    this.cam = new THREE.Vector3();
+  },
+  tick: function (t, dt) {
+    if (!dt) return;
+    const m = SIM.model, s = Math.min(dt / 1000, 0.1);
+    SIM.fps = SIM.fps * 0.95 + 0.05 * (1 / Math.max(s, 1e-3));
+    P.turn = P.turnDeg * Math.PI / 180;     // turning limit: largest turning rate (rad/s)
+    if (m.n !== P.n) m.setCount(P.n);
+    if (m.preds.length !== P.preds) m.setPredators(P.preds);
+    toStage(this.el.sceneEl.camera, this.cam);
+    m.viewer.x = this.cam.x; m.viewer.y = this.cam.y; m.viewer.z = this.cam.z;
+    if (P.paused) return;
+    SIM.acc += s * P.speed;
+    let k = 0;
+    while (SIM.acc >= FIX.dt && k < 3) {
+      const t0 = performance.now();
+      m.step();
+      SIM.stepMs = SIM.stepMs * 0.9 + 0.1 * (performance.now() - t0);
+      SIM.acc -= FIX.dt; k++;
+    }
+    if (k === 3) SIM.acc = 0;     // running behind: drop time rather than spiral
+  }
+});
+
+// Draws every fish and predator from the model, interpolated between model steps
+AFRAME.registerComponent('fish-school', {
+  init: function () {
+    const fish = swimmingMesh(fishGeometry(0.24, '#24465c', '#dce8f0', '#7f9db0'), MAXN, 0.24, 16, 0.10);
+    this.fish = fish.mesh; this.fishT = fish.uTime;
+    this.fish.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAXN * 3), 3);
+    this.fish.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    const rnd = mulberry32(7);
+    this.base = new Float32Array(MAXN * 3);
+    for (let i = 0; i < MAXN; i++) {   // slight individual variation in tint
+      const b = 0.85 + 0.25 * rnd();
+      this.base[i * 3] = b * (0.95 + 0.1 * rnd()); this.base[i * 3 + 1] = b; this.base[i * 3 + 2] = b * (1.0 + 0.08 * rnd());
+    }
+    const pred = swimmingMesh(fishGeometry(0.9, '#2a333b', '#8c979f', '#3b4650'), 4, 0.9, 5, 0.12);
+    this.pred = pred.mesh; this.predT = pred.uTime;
+    this.el.object3D.add(this.fish); this.el.object3D.add(this.pred);
+  },
+  tick: function (t) {
+    const m = SIM.model; if (!m) return;
+    const a = P.paused ? 1 : clamp(SIM.acc / FIX.dt, 0, 1);
+    this.clock = (this.clock || 0) + (P.paused || !this.lastT ? 0 : Math.min(t - this.lastT, 100) / 1000 * P.speed);
+    this.lastT = t;
+    this.fishT.value = this.predT.value = this.clock;
+    const arr = this.fish.instanceMatrix.array, col = this.fish.instanceColor.array, base = this.base;
+    const n = Math.min(m.n, MAXN);
+    for (let i = 0; i < n; i++) {
+      const x = m.px[i] + (m.x[i] - m.px[i]) * a, y = m.py[i] + (m.y[i] - m.py[i]) * a, z = m.pz[i] + (m.z[i] - m.pz[i]) * a;
+      writePose(arr, i, x, y, z, m.vx[i], m.vy[i], m.vz[i]);
+      const f = m.fear[i], o = i * 3;      // alarmed fish flash silver
+      col[o] = base[o] + (1.6 - base[o]) * f; col[o + 1] = base[o + 1] + (1.6 - base[o + 1]) * f; col[o + 2] = base[o + 2] + (1.6 - base[o + 2]) * f;
+    }
+    this.fish.count = n;
+    this.fish.instanceMatrix.needsUpdate = true; this.fish.instanceColor.needsUpdate = true;
+    const pa = this.pred.instanceMatrix.array;
+    m.preds.forEach((p, k) => writePose(pa, k, p.px + (p.x - p.px) * a, p.py + (p.y - p.py) * a, p.pz + (p.z - p.pz) * a, p.vx, p.vy, p.vz));
+    this.pred.count = m.preds.length;
+    this.pred.instanceMatrix.needsUpdate = true;
+  }
+});
+
+// Underwater surroundings: seabed, rocks, the surface overhead, light shafts and drifting particles
+AFRAME.registerComponent('seascape', {
+  init: function () {
+    const o = this.el.object3D, rnd = mulberry32(11);
+    const bed = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), new THREE.MeshLambertMaterial({ color: '#7c8a6a' }));
+    bed.rotation.x = -Math.PI / 2; o.add(bed);
+    // sand ripples as faint darker rings for depth cues
+    const rockMat = new THREE.MeshLambertMaterial({ color: '#5d6b62', flatShading: true });
+    for (let k = 0; k < 45; k++) {
+      const r = 3 + rnd() * 18, a = rnd() * Math.PI * 2, s = 0.2 + rnd() * 0.9;
+      const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0), rockMat);
+      rock.position.set(Math.cos(a) * r, s * 0.3, Math.sin(a) * r);
+      rock.scale.set(1 + rnd(), 0.5 + rnd() * 0.6, 1 + rnd());
+      rock.rotation.set(rnd() * 3, rnd() * 3, rnd() * 3);
+      o.add(rock);
+    }
+    const weedMat = new THREE.MeshLambertMaterial({ color: '#3f6b4a', side: THREE.DoubleSide });
+    this.weeds = [];
+    for (let k = 0; k < 70; k++) {
+      const r = 2.5 + rnd() * 16, a = rnd() * Math.PI * 2, h = 0.4 + rnd() * 1.4;
+      const g = new THREE.PlaneGeometry(0.08, h, 1, 4); g.translate(0, h / 2, 0);
+      const w = new THREE.Mesh(g, weedMat);
+      w.position.set(Math.cos(a) * r, 0, Math.sin(a) * r); w.rotation.y = rnd() * 3;
+      w.userData.ph = rnd() * 6; o.add(w); this.weeds.push(w);
+    }
+    const surf = new THREE.Mesh(new THREE.PlaneGeometry(80, 80),
+      new THREE.MeshBasicMaterial({ color: '#8fd2ff', transparent: true, opacity: 0.55, side: THREE.DoubleSide }));
+    surf.rotation.x = Math.PI / 2; surf.position.y = 6.6; o.add(surf);
+    // light shafts from the surface
+    this.shafts = [];
+    const shaftMat = new THREE.MeshBasicMaterial({ color: '#bfe8ff', transparent: true, opacity: 0.022, depthWrite: false,
+                                                  blending: THREE.AdditiveBlending, side: THREE.DoubleSide });
+    for (let k = 0; k < 14; k++) {
+      const r = 3 + rnd() * 11, a = rnd() * Math.PI * 2, w = 0.25 + rnd() * 0.6;
+      const g = new THREE.CylinderGeometry(w * 0.6, w * 1.4, 7, 10, 1, true); g.translate(0, -3.5, 0);
+      const sh = new THREE.Mesh(g, shaftMat);
+      sh.position.set(Math.cos(a) * r, 6.6, Math.sin(a) * r);
+      sh.rotation.z = 0.18; sh.userData.ph = rnd() * 6;
+      o.add(sh); this.shafts.push(sh);
+    }
+    // marine snow: drifting specks that show your own movement through the water
+    const N = 2500, pos = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) { pos[i * 3] = (rnd() - 0.5) * 24; pos[i * 3 + 1] = rnd() * 6.5; pos[i * 3 + 2] = (rnd() - 0.5) * 24; }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const dot = document.createElement('canvas'); dot.width = dot.height = 32;
+    const dc = dot.getContext('2d'), gr = dc.createRadialGradient(16, 16, 0, 16, 16, 16);
+    gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.4, 'rgba(255,255,255,0.5)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    dc.fillStyle = gr; dc.fillRect(0, 0, 32, 32);
+    this.snow = new THREE.Points(g, new THREE.PointsMaterial({ color: '#d8f0ff', size: 0.02, map: new THREE.CanvasTexture(dot),
+                                                               transparent: true, opacity: 0.8, depthWrite: false }));
+    o.add(this.snow);
+  },
+  tick: function (t, dt) {
+    const s = t / 1000;
+    for (const w of this.weeds) w.rotation.z = 0.15 * Math.sin(s * 0.8 + w.userData.ph);
+    for (const sh of this.shafts) sh.rotation.x = 0.06 * Math.sin(s * 0.25 + sh.userData.ph);
+    if (!dt) return;
+    const p = this.snow.geometry.attributes.position.array, d = Math.min(dt, 100) / 1000;
+    for (let i = 0; i < p.length; i += 3) {
+      p[i + 1] -= 0.03 * d; p[i] += 0.02 * d;
+      if (p[i + 1] < 0) p[i + 1] += 6.5;
+      if (p[i] > 12) p[i] -= 24;
+    }
+    this.snow.geometry.attributes.position.needsUpdate = true;
+  }
+});
+
+// Squeeze a controller's grip to become a threat: nearby fish flee from your hand
+AFRAME.registerComponent('hand-threat', {
+  init: function () {
+    this.h = { x: 0, y: -10, z: 0, on: false };
+    this.mat = new THREE.MeshBasicMaterial({ color: '#9fd3ff', transparent: true, opacity: 0.5, fog: false });
+    this.ball = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), this.mat);
+    this.el.object3D.add(this.ball);
+    this.el.addEventListener('gripdown', () => { this.h.on = true; });
+    this.el.addEventListener('gripup', () => { this.h.on = false; });
+    this.tmp = new THREE.Vector3();
+  },
+  tick: function () {
+    const m = SIM.model; if (!m) return;
+    if (m.hands.indexOf(this.h) < 0) m.hands.push(this.h);
+    toStage(this.el.object3D, this.tmp);
+    this.h.x = this.tmp.x; this.h.y = this.tmp.y; this.h.z = this.tmp.z;
+    this.mat.color.set(this.h.on ? COL.fear : '#9fd3ff'); this.mat.opacity = this.h.on ? 0.9 : 0.5;
+    this.ball.scale.setScalar(this.h.on ? 2.2 : 1);
+  }
+});
+
+// B or Y on the controllers (or H on a keyboard) shows and hides the panel
+AFRAME.registerComponent('panel-toggle', {
+  init: function () {
+    const flip = () => { SIM.panel = !SIM.panel; };
+    document.querySelectorAll('[laser-controls]').forEach(c => { c.addEventListener('bbuttondown', flip); c.addEventListener('ybuttondown', flip); });
+    window.addEventListener('keydown', (e) => { if (e.key === 'h' || e.key === 'H') flip(); });
+  },
+  tick: function () {
+    const p = document.querySelector('#panel').object3D;
+    p.visible = SIM.panel;
+  }
+});
+
+// ---------- Readout: state of the largest school and its order parameters over time ----------
+AFRAME.registerComponent('info-display', {
+  init: function () {
+    this.c = makeCanvasPlane(0.72, 1024, 1200);
+    this.el.object3D.add(this.c.mesh);
+    this.last = 0;
+  },
+  tick: function (t) {
+    if (!SIM.panel || t - this.last < 150) return;
+    this.last = t;
+    this.draw();
+  },
+  draw: function () {
+    const c = this.c.ctx, m = SIM.model, W = 1024, H = 1200;
+    c.clearRect(0, 0, W, H);
+    c.fillStyle = COL.panel; roundRect(c, 0, 0, W, H, 28); c.fill();
+    c.textBaseline = 'alphabetic'; c.textAlign = 'left';
+    c.fillStyle = COL.muted; c.font = `700 28px ${FONT}`; c.fillText('FISH SCHOOL IN 3D', 40, 58);
+    const pr = PRESETS[SIM.preset];
+    c.fillStyle = COL.text; c.font = `700 44px ${FONT}`; c.fillText(pr ? pr.name : 'Custom settings', 40, 118);
+    c.fillStyle = '#b9c7da'; c.font = `27px ${FONT}`;
+    const txt = pr ? pr.text : 'You have changed the rules. Watch how the school responds, then try a preset to compare.';
+    wrapLines(c, txt, 944).slice(0, 3).forEach((ln, k) => c.fillText(ln, 40, 164 + k * 36));
+
+    // the largest school
+    const [st, sub] = schoolState(m);
+    c.fillStyle = COL.muted; c.font = `28px ${FONT}`; c.fillText('Largest school', 40, 302);
+    c.fillStyle = COL.text; c.font = `700 56px ${FONT}`; c.fillText(st, 40, 366);
+    c.fillStyle = '#b9c7da'; c.font = `26px ${FONT}`;
+    c.fillText(`${sub}   ·   ${m.main} of ${m.n} fish   ·   ${m.groups} school${m.groups === 1 ? '' : 's'} of 10+`, 40, 408);
+
+    const bar = (y, label, v, col) => {
+      c.fillStyle = COL.text; c.font = `28px ${FONT}`; c.fillText(label, 40, y);
+      c.fillStyle = col; c.font = `700 40px ${FONT}`; c.textAlign = 'right'; c.fillText(v.toFixed(2), 984, y + 2); c.textAlign = 'left';
+      c.fillStyle = '#1d2a3d'; roundRect(c, 40, y + 18, 944, 16, 8); c.fill();
+      c.fillStyle = col; roundRect(c, 40, y + 18, Math.max(16, 944 * clamp(v, 0, 1)), 16, 8); c.fill();
+    };
+    bar(470, 'Polarisation P  (1 = all heading the same way)', m.polar, COL.P);
+    bar(546, 'Milling M  (1 = all circling one centre)', m.mill, COL.M);
+    bar(622, 'Neighbour alignment  (1 = matching the fish you see)', m.local, COL.L);
+
+    // time series
+    const px0 = 70, px1 = 984, py0 = 726, py1 = 900, span = 60;
+    const h = m.hist, tN = m.t, tA = Math.max(0, tN - span), tB = Math.max(span, tN);
+    c.fillStyle = COL.muted; c.font = `24px ${FONT}`;
+    c.fillText(`Largest school, last ${span} s of model time`, 40, 704);
+    c.strokeStyle = 'rgba(143,163,191,0.25)'; c.lineWidth = 1; c.textAlign = 'right'; c.font = `20px ${FONT}`;
+    for (const v of [0, 0.5, 1]) {
+      const y = py1 - v * (py1 - py0);
+      c.beginPath(); c.moveTo(px0, y); c.lineTo(px1, y); c.stroke();
+      c.fillStyle = COL.muted; c.fillText(v.toFixed(1), px0 - 10, y + 7);
+    }
+    c.textAlign = 'left';
+    const X = tt => px0 + (tt - tA) / (tB - tA) * (px1 - px0), Y = v => py1 - clamp(v, 0, 1) * (py1 - py0);
+    [[3, COL.L], [1, COL.P], [2, COL.M]].forEach(([k, col]) => {
+      c.strokeStyle = col; c.lineWidth = 4; c.beginPath(); let first = true;
+      for (const q of h) { if (q[0] < tA) continue; const xx = X(q[0]), yy = Y(q[k]); if (first) { c.moveTo(xx, yy); first = false; } else c.lineTo(xx, yy); }
+      c.stroke();
+    });
+
+    // footer
+    let y = 966;
+    c.fillStyle = '#d5deea'; c.font = `27px ${FONT}`;
+    if (m.preds.length) {
+      c.fillStyle = COL.fear; c.font = `600 30px ${FONT}`;
+      c.fillText(`Fish caught: ${m.catches}   (${(m.catches / Math.max(m.t / 60, 1e-6)).toFixed(1)} per minute)`, 40, y); y += 44;
+    }
+    c.fillStyle = '#b9c7da'; c.font = `26px ${FONT}`;
+    c.fillText('Squeeze a grip button: your hand scares the fish.', 40, y); y += 38;
+    c.fillText('B or Y hides this panel. Walk into the school: fish avoid you.', 40, y); y += 38;
+    c.fillStyle = COL.muted; c.font = `22px ${FONT}`;
+    c.fillText(`${m.n} fish · model step ${SIM.stepMs.toFixed(1)} ms · ${SIM.fps.toFixed(0)} frames/s`, 40, H - 30);
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Draggable slider (works with Quest controllers and a mouse) ----------
+AFRAME.registerComponent('ui-slider', {
+  schema: { key: { type: 'string' }, min: { type: 'number' }, max: { type: 'number' },
+            step: { type: 'number', default: 1 }, decimals: { type: 'int', default: 0 },
+            label: { type: 'string' }, unit: { type: 'string', default: '' },
+            width: { type: 'number', default: 0.56 }, rule: { type: 'boolean', default: true } },
+  init: function () {
+    const d = this.data, w = d.width, o = new THREE.Group();
+    const basic = (col, opts) => new THREE.MeshBasicMaterial(Object.assign({ color: col, transparent: true, fog: false }, opts || {}));
+    this.label = makeCanvasPlane(w, 640, 52);
+    this.label.mesh.position.set(0, 0.028, 0.001); o.add(this.label.mesh);
+    const track = new THREE.Mesh(new THREE.PlaneGeometry(w, 0.012), basic('#26364d'));
+    track.position.set(0, -0.018, 0.001); o.add(track);
+    const fg = new THREE.PlaneGeometry(w, 0.012); fg.translate(w / 2, 0, 0);
+    this.fill = new THREE.Mesh(fg, basic('#4aa3df')); this.fill.position.set(-w / 2, -0.018, 0.0015); o.add(this.fill);
+    this.knobMat = basic('#eef3f8');
+    this.knob = new THREE.Mesh(new THREE.CircleGeometry(0.02, 32), this.knobMat);
+    this.knob.position.set(0, -0.018, 0.002); o.add(this.knob);
+    const hit = new THREE.Mesh(new THREE.PlaneGeometry(w + 0.06, 0.085), basic('#ffffff', { opacity: 0, depthWrite: false }));
+    hit.position.set(0, 0.005, 0.0005); o.add(hit);
+    this.el.setObject3D('ui', o);
+    this.hover = false; this.dragging = false; this.drawn = '';
+    this.el.addEventListener('mouseenter', () => { this.hover = true; });
+    this.el.addEventListener('mouseleave', () => { this.hover = false; });
+    this.el.addEventListener('mousedown', (e) => {
+      if (!SIM.panel) return;
+      this.cursorEl = e.detail.cursorEl; this.dragging = true;
+      this.setFromHit(e.detail.intersection);
+      holdLook(this.cursorEl, () => { this.dragging = false; });
+    });
+  },
+  setFromHit: function (hit) {
+    if (!hit) return;
+    const d = this.data, lp = this.el.object3D.worldToLocal(hit.point.clone());
+    const frac = clamp((lp.x + d.width / 2) / d.width, 0, 1);
+    let v = Math.round((d.min + frac * (d.max - d.min)) / d.step) * d.step;
+    v = clamp(v, d.min, d.max);
+    if (v !== P[d.key]) {
+      P[d.key] = v;
+      if (d.rule) SIM.preset = 'custom';
+    }
+  },
+  tick: function () {
+    const d = this.data;
+    setClickable(this.el, SIM.panel);
+    if (!SIM.panel) { this.dragging = false; return; }
+    if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
+      this.setFromHit(this.cursorEl.components.raycaster.getIntersection(this.el));
+    }
+    const v = P[d.key], frac = clamp((v - d.min) / (d.max - d.min), 0, 1), on = this.hover || this.dragging;
+    this.knob.position.x = -d.width / 2 + frac * d.width;
+    this.fill.scale.x = Math.max(frac, 0.0001);
+    this.knobMat.color.set(on ? '#ffd166' : '#eef3f8');
+    this.knob.scale.setScalar(on ? 1.25 : 1);
+    const valTxt = `${v.toFixed(d.decimals)} ${d.unit}`.trim();
+    const txt = `${d.label}|${valTxt}`;
+    if (txt !== this.drawn) {
+      this.drawn = txt;
+      const c = this.label.ctx; c.clearRect(0, 0, 640, 52);
+      c.textBaseline = 'middle'; c.fillStyle = COL.text;
+      c.font = `30px ${FONT}`; c.textAlign = 'left'; c.fillText(d.label, 2, 28);
+      c.font = `700 30px ${FONT}`; c.textAlign = 'right'; c.fillText(valTxt, 638, 28);
+      this.label.tex.needsUpdate = true;
+    }
+  }
+});
+
+function setClickable(el, on) {
+  if (el._clickable === on) return;
+  el._clickable = on;
+  if (on) el.classList.add('clickable'); else el.classList.remove('clickable');
+}
+
+// While dragging with the mouse, stop the camera from rotating; call onUp when released
+function holdLook(cursorEl, onUp) {
+  const cam = document.querySelector('[camera]');
+  const mouse = cursorEl === cursorEl.sceneEl || cursorEl.tagName === 'A-SCENE';
+  if (mouse && cam) cam.setAttribute('look-controls', 'enabled', false);
+  const up = () => {
+    onUp();
+    if (mouse && cam) cam.setAttribute('look-controls', 'enabled', true);
+    cursorEl.removeEventListener('mouseup', up);
+  };
+  cursorEl.addEventListener('mouseup', up);
+}
+
+// ---------- Grab handle: point at it and hold the trigger to move the panel ----------
+AFRAME.registerComponent('grab-move', {
+  schema: { target: { type: 'selector' }, label: { type: 'string', default: '' }, width: { type: 'number', default: 0.6 } },
+  init: function () {
+    this.c = makeCanvasPlane(this.data.width, 768, 80);
+    const grp = new THREE.Group(); grp.add(this.c.mesh);
+    this.el.setObject3D('ui', grp);
+    this.hover = false; this.dragging = false; this.drawn = '';
+    this.offset = new THREE.Vector3(); this.tmp = new THREE.Vector3(); this.cam = new THREE.Vector3();
+    const t = this.data.target.object3D;
+    this.home = { p: t.position.clone(), y: t.rotation.y };
+    this.el.sceneEl.addEventListener('reset-poses', () => { t.position.copy(this.home.p); t.rotation.y = this.home.y; });
+    this.el.addEventListener('mouseenter', () => { this.hover = true; });
+    this.el.addEventListener('mouseleave', () => { this.hover = false; });
+    this.el.addEventListener('mousedown', (e) => {
+      const hit = e.detail.intersection; if (!hit || !SIM.panel) return;
+      this.cursorEl = e.detail.cursorEl; this.dragging = true;
+      this.dist = hit.distance;
+      const tg = this.data.target.object3D;
+      tg.updateMatrixWorld(true);
+      this.offset.copy(tg.worldToLocal(hit.point.clone()));
+      holdLook(this.cursorEl, () => { this.dragging = false; });
+    });
+  },
+  tick: function () {
+    setClickable(this.el, SIM.panel);
+    if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
+      const ray = this.cursorEl.components.raycaster.raycaster.ray;
+      const tg = this.data.target.object3D, parent = tg.parent;
+      const target = parent.worldToLocal(this.tmp.copy(ray.direction).multiplyScalar(this.dist).add(ray.origin));
+      this.el.sceneEl.camera.getWorldPosition(this.cam); parent.worldToLocal(this.cam);
+      tg.rotation.y = Math.atan2(this.cam.x - target.x, this.cam.z - target.z);   // keep facing the viewer
+      tg.position.copy(target);
+      tg.updateMatrix();
+      tg.position.sub(this.offset.clone().applyQuaternion(tg.quaternion));
+    }
+    const key = this.hover + '' + this.dragging;
+    if (key === this.drawn) return;
+    this.drawn = key;
+    const c = this.c.ctx, on = this.hover || this.dragging;
+    c.clearRect(0, 0, 768, 80);
+    c.fillStyle = on ? '#3a86b8' : '#22324a'; roundRect(c, 4, 4, 760, 72, 36); c.fill();
+    c.fillStyle = COL.text; c.font = `600 32px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(this.dragging ? 'Moving… release to place' : '✥  ' + this.data.label, 384, 42);
+    this.c.tex.needsUpdate = true;
+  }
+});
+
+// Keep the scene at the right height if the headset reports eye level rather than floor level
+AFRAME.registerComponent('auto-height', {
+  schema: { target: { type: 'selector' } },
+  init: function () {
+    const v = new THREE.Vector3();
+    this.el.addEventListener('enter-vr', () => {
+      setTimeout(() => {
+        this.el.camera.el.object3D.getWorldPosition(v);
+        if (v.y > 0.4) this.data.target.object3D.position.y = v.y - 1.6;
+      }, 1000);
+    });
+    this.el.addEventListener('exit-vr', () => { this.data.target.object3D.position.y = 0; });
+  }
+});
+
+// ---------- Buttons ----------
+AFRAME.registerComponent('ui-button', {
+  schema: { action: { type: 'string' }, width: { type: 'number', default: 0.18 } },
+  init: function () {
+    this.W = Math.round(512 * this.data.width / 0.27);
+    this.c = makeCanvasPlane(this.data.width, this.W, 124);
+    const grp = new THREE.Group(); grp.add(this.c.mesh);
+    this.el.setObject3D('ui', grp);
+    this.hover = false; this.drawn = '';
+    this.el.addEventListener('mouseenter', () => { this.hover = true; });
+    this.el.addEventListener('mouseleave', () => { this.hover = false; });
+    this.el.addEventListener('click', () => {
+      if (!SIM.panel) return;
+      const a = this.data.action, m = SIM.model;
+      if (PRESETS[a]) { applyPreset(a); if (a === 'mill') { m.scatter(); SIM.acc = 0; } return; }
+      switch (a) {
+        case 'pause': P.paused = !P.paused; break;
+        case 'startle': {   // a sudden disturbance 2.5 m in front of you
+          const cam = this.el.sceneEl.camera, dir = new THREE.Vector3();
+          cam.getWorldDirection(dir); dir.y = 0; dir.normalize();
+          const p = toStage(cam, new THREE.Vector3()).add(dir.multiplyScalar(2.5));
+          m.scare(p.x, p.y, p.z); break;
+        }
+        case 'scatter': m.scatter(); SIM.acc = 0; break;
+        case 'hide': SIM.panel = false; break;
+        case 'reset': applyPreset('school'); P.n = 500; P.speed = 1; P.paused = false; m.setCount(P.n); m.scatter();
+                      this.el.sceneEl.emit('reset-poses'); break;
+      }
+    });
+  },
+  state: function () {
+    const a = this.data.action;
+    if (PRESETS[a]) return [a === 'mill' ? 'Mill' : PRESETS[a].name, SIM.preset === a];
+    switch (a) {
+      case 'pause': return [P.paused ? '▶  Resume' : '❚❚  Pause', P.paused];
+      case 'startle': return ['Startle', false];
+      case 'scatter': return ['Scatter', false];
+      case 'hide': return ['Hide panel', false];
+      default: return ['↺  Reset', false];
+    }
+  },
+  tick: function () {
+    setClickable(this.el, SIM.panel);
+    const [label, active] = this.state();
+    const key = label + active + this.hover;
+    if (key === this.drawn) return;
+    this.drawn = key;
+    const c = this.c.ctx, W = this.W;
+    c.clearRect(0, 0, W, 124);
+    c.fillStyle = active ? (this.hover ? '#3a86b8' : '#2a6f97') : (this.hover ? '#2c3e55' : '#1b2738');
+    roundRect(c, 4, 4, W - 8, 116, 22); c.fill();
+    c.strokeStyle = this.hover ? '#ffd166' : 'rgba(143,163,191,0.4)'; c.lineWidth = 4;
+    roundRect(c, 4, 4, W - 8, 116, 22); c.stroke();
+    c.fillStyle = COL.text; c.font = `600 34px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(label, W / 2, 64);
+    this.c.tex.needsUpdate = true;
+  }
+});
+    </script>
+  </head>
+  <body>
+    <!--
+      FISH SCHOOL IN 3D (VR)
+      An agent-based school of fish all around you. Each fish follows three local rules
+      (separation, alignment, cohesion), as in the 2D flocking app, now in three dimensions.
+      Desktop: drag to look around, WASD to move, click and drag sliders, H hides the panel.
+      Quest: open in the browser, press the VR button. Point with either controller and pull the
+      trigger to use the panel; squeeze a grip button to scare fish with your hand; B or Y hides the panel.
+    -->
+    <a-scene background="color: #0b3c5a"
+             fog="type: exponential; color: #0b3c5a; density: 0.14"
+             light="defaultLightsEnabled: false"
+             renderer="antialias: true; colorManagement: true; foveationLevel: 1"
+             cursor="rayOrigin: mouse; fuse: false"
+             raycaster="objects: .clickable; far: 20"
+             sim-runner panel-toggle auto-height="target: #stage">
+
+      <a-entity light="type: ambient; color: #7fb4d4; intensity: 0.9"></a-entity>
+      <a-entity light="type: directional; color: #e6f7ff; intensity: 1.3" position="0.3 1 0.2"></a-entity>
+      <a-entity light="type: hemisphere; color: #a8dcff; groundColor: #2b4a3a; intensity: 0.5"></a-entity>
+
+      <!-- Everything in #stage is shifted up or down in VR to match your eye height -->
+      <a-entity id="stage">
+        <a-entity seascape></a-entity>
+        <a-entity fish-school></a-entity>
+
+        <!-- A small platform under your feet, which helps with comfort in VR -->
+        <a-ring radius-inner="0.48" radius-outer="0.52" rotation="-90 0 0" position="0 0.01 0"
+                material="shader: flat; color: #2f7fb8; opacity: 0.6; transparent: true"></a-ring>
+
+        <!-- Control panel -->
+        <a-entity id="panel" position="0.55 1.0 -1.05" rotation="-30 -28 0">
+          <a-entity grab-move="target: #panel; label: Grab here to move panel; width: 0.6" position="0 0.52 0.002"></a-entity>
+          <a-plane width="1.46" height="0.98" position="0 0 -0.004" material="shader: flat; color: #2a3b55; fog: false"></a-plane>
+          <a-plane width="1.44" height="0.96" position="0 0 -0.002" material="shader: flat; color: #0b1320; fog: false"></a-plane>
+
+          <a-entity info-display position="-0.355 0 0.001"></a-entity>
+
+          <a-entity ui-slider="key: sep; min: 0; max: 3; step: 0.1; decimals: 1; label: Separation" position="0.36 0.420 0.002"></a-entity>
+          <a-entity ui-slider="key: ali; min: 0; max: 3; step: 0.1; decimals: 1; label: Alignment" position="0.36 0.345 0.002"></a-entity>
+          <a-entity ui-slider="key: coh; min: 0; max: 3; step: 0.1; decimals: 1; label: Cohesion" position="0.36 0.270 0.002"></a-entity>
+          <a-entity ui-slider="key: R; min: 0.4; max: 2; step: 0.1; decimals: 1; label: Perception radius; unit: m" position="0.36 0.195 0.002"></a-entity>
+          <a-entity ui-slider="key: blind; min: 0; max: 180; step: 10; label: Blind angle behind; unit: °" position="0.36 0.120 0.002"></a-entity>
+          <a-entity ui-slider="key: turnDeg; min: 20; max: 150; step: 5; label: Fastest turn; unit: °/s" position="0.36 0.045 0.002"></a-entity>
+          <a-entity ui-slider="key: n; min: 50; max: 1000; step: 50; label: Number of fish; rule: false" position="0.36 -0.030 0.002"></a-entity>
+          <a-entity ui-slider="key: preds; min: 0; max: 3; step: 1; label: Predators; rule: false" position="0.36 -0.105 0.002"></a-entity>
+          <a-entity ui-slider="key: speed; min: 0.25; max: 2; step: 0.25; decimals: 2; label: Simulation speed; unit: ×; rule: false" position="0.36 -0.180 0.002"></a-entity>
+
+          <a-entity ui-button="action: school" position="0.17 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: noali" position="0.36 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: loners" position="0.55 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: mill" position="0.17 -0.35 0.002"></a-entity>
+          <a-entity ui-button="action: attack" position="0.36 -0.35 0.002"></a-entity>
+          <a-entity ui-button="action: startle" position="0.55 -0.35 0.002"></a-entity>
+          <a-entity ui-button="action: pause" position="0.17 -0.435 0.002"></a-entity>
+          <a-entity ui-button="action: scatter" position="0.36 -0.435 0.002"></a-entity>
+          <a-entity ui-button="action: hide" position="0.55 -0.435 0.002"></a-entity>
+        </a-entity>
+      </a-entity>
+
+      <!-- Camera and Quest controllers (laser pointers; grip = scare fish) -->
+      <a-entity id="rig">
+        <a-entity camera look-controls wasd-controls="acceleration: 20" position="0 1.6 0"></a-entity>
+        <a-entity laser-controls="hand: left" hand-threat raycaster="objects: .clickable; far: 8; lineColor: #9fd3ff; lineOpacity: 0.7"></a-entity>
+        <a-entity laser-controls="hand: right" hand-threat raycaster="objects: .clickable; far: 8; lineColor: #9fd3ff; lineOpacity: 0.7"></a-entity>
+      </a-entity>
+    </a-scene>
+  </body>
+</html>

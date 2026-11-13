@@ -17,7 +17,7 @@ const YEAR = 3.156e7;           // seconds per year
 const WINDOW = 40;              // model years shown on the time-series plot
 
 const DEFAULTS = { S0: 1361, albedo: 0.30, eps: 0.78, speed: 1.0,
-                   atmosphere: true, iceFeedback: false, paused: false };
+                   atmosphere: true, iceFeedback: false, paused: false, atmEmit: true };
 
 const SIM = {
   params: Object.assign({}, DEFAULTS),
@@ -46,11 +46,20 @@ function effectiveAlbedo(Ts) {
   return clamp(p.albedo + 0.35 * (iceFraction(iceEdgeLat(Ts)) - F_ICE_REF), 0, 0.9);
 }
 
+// Ice edge drawn on the globe. Feedback on: set by temperature (and it drives the albedo).
+// Feedback off: set by the albedo slider, by inverting the same ice-albedo relation.
+function displayIceEdge() {
+  const p = SIM.params;
+  if (p.iceFeedback) return iceEdgeLat(SIM.Ts);
+  const f = clamp(F_ICE_REF + (p.albedo - DEFAULTS.albedo) / 0.35, 0, 1);
+  return Math.asin(1 - f) * 180 / Math.PI;
+}
+
 function equilibriumTs() {
   const p = SIM.params;
   const a = effectiveAlbedo(SIM.Ts);
   const Te = Math.pow((1 - a) * p.S0 / 4 / SIGMA, 0.25);
-  return p.atmosphere ? Te * Math.pow(2 / (2 - p.eps), 0.25) : Te;
+  return p.atmosphere && p.atmEmit ? Te * Math.pow(2 / (2 - p.eps), 0.25) : Te;
 }
 
 function stepModel(dtYears) {
@@ -60,7 +69,11 @@ function stepModel(dtYears) {
   for (let i = 0; i < n; i++) {
     const absorbed = (1 - effectiveAlbedo(SIM.Ts)) * p.S0 / 4;
     const up = SIGMA * Math.pow(SIM.Ts, 4);
-    if (p.atmosphere) {
+    if (p.atmosphere && !p.atmEmit) {
+      // explainer step 6: the atmosphere absorbs infrared but has not started emitting,
+      // so the surface budget is unchanged and the absorbed energy simply accumulates aloft
+      SIM.Ts += (absorbed - up) / SIM.Cs * dt;
+    } else if (p.atmosphere) {
       const atm = p.eps * SIGMA * Math.pow(SIM.Ta, 4);
       const dTs = (absorbed + atm - up) / SIM.Cs;
       const dTa = (p.eps * up - 2 * atm) / SIM.Ca;
@@ -89,13 +102,16 @@ function computeFluxes() {
   f.surfIR = SIGMA * Math.pow(SIM.Ts, 4);
   if (p.atmosphere) {
     f.atmAbs = p.eps * f.surfIR;
-    f.back = p.eps * SIGMA * Math.pow(SIM.Ta, 4);
+    f.back = p.atmEmit ? p.eps * SIGMA * Math.pow(SIM.Ta, 4) : 0;
     f.atmUp = f.back;
-    f.olr = (1 - p.eps) * f.surfIR + f.atmUp;
+    f.trans = (1 - p.eps) * f.surfIR;
+    f.olr = f.trans + f.atmUp;
   } else {
-    f.atmAbs = 0; f.back = 0; f.atmUp = 0; f.olr = f.surfIR;
+    f.atmAbs = 0; f.back = 0; f.atmUp = 0; f.trans = f.surfIR; f.olr = f.surfIR;
   }
   f.imbalance = f.absorbed - f.olr;
+  f.surfNet = f.absorbed + f.back - f.surfIR;              // net energy into the surface (W/m2)
+  f.rate = f.surfNet / SIM.Cs * YEAR;                      // surface warming rate (degrees per year)
 }
 
 function resetSim() {
@@ -118,11 +134,12 @@ SIM.mode = 'main';          // 'main' or 'explain'
 SIM.step = 0;
 SIM.showArrows = true;
 SIM.showEq = false;
+SIM.showBudget = false;
 
-const ALL_ARROWS = ['in', 'refl', 'surf', 'back', 'olr'];
+const ALL_ARROWS = ['in', 'refl', 'surf', 'trans', 'up', 'back'];
 function V(o) {
   return Object.assign({ beam: true, sw: true, refl: true, surfIR: true, atmEmit: true, shell: true,
-                         shadow: false, arrows: ALL_ARROWS, showTemp: true }, o);
+                         shadow: false, arrows: ALL_ARROWS, showTemp: true, equation: false }, o);
 }
 
 const STEPS = [
@@ -149,18 +166,18 @@ const STEPS = [
     eq: '(1 − α) S₀/4 = σT⁴   →   T ≈ 255 K ≈ −18 °C',
     params: { atmosphere: false }, view: V({ atmEmit: false, arrows: ['in', 'refl', 'surf'] }) },
   { title: 'The atmosphere traps infrared',
-    text: 'Gases such as water vapour and carbon dioxide let sunlight pass through, but absorb much of the infrared rising from the surface. In this model the atmosphere (the blue shell) absorbs 78% of it. Notice that the orange stream now mostly stops at the shell.',
-    eq: 'Absorbed by atmosphere = ε × σTₛ⁴,   ε ≈ 0.78',
-    params: {}, view: V({ atmEmit: false, arrows: ['in', 'refl', 'surf'] }) },
+    text: 'Gases such as water vapour and carbon dioxide let sunlight pass through, but absorb much of the infrared rising from the surface. In this model the atmosphere (the blue shell) absorbs 78% of it. Most of the orange stream now stops at the shell; only 22% escapes to space. Energy is now piling up in the atmosphere. But notice the surface temperature has not changed: the surface still loses just as much heat as before.',
+    eq: 'Absorbed = ε × σTₛ⁴     Escapes = (1 − ε) × σTₛ⁴,   ε ≈ 0.78',
+    params: { atmEmit: false }, view: V({ atmEmit: false, arrows: ['in', 'refl', 'surf', 'trans'] }) },
   { title: 'Back-radiation warms the surface',
-    text: 'The atmosphere warms up and glows in infrared too (pink), sending energy both out to space and back down to the ground. The surface now receives sunlight plus this back-radiation, so it warms until everything balances again, at about +15 °C. This is the greenhouse effect.',
+    text: 'The atmosphere warms up and glows in infrared too (pink), sending energy both out to space and back down to the ground. The surface now receives sunlight plus this back-radiation, so watch it warm from −18 °C until everything balances again at about +15 °C. This is the greenhouse effect.',
     eq: 'Tₛ = Tₑ × (2 / (2 − ε))^¼   with   Tₑ = 255 K',
     params: {}, view: V({}),
     slider: { key: 'eps', min: 0, max: 1, step: 0.01, decimals: 2, label: 'Greenhouse strength ε', unit: '' } },
   { title: 'Out of balance',
-    text: 'If something changes, such as adding greenhouse gases, the planet is briefly out of balance: more energy arrives than leaves. The extra energy warms the planet until balance returns. Raise the greenhouse strength and watch the imbalance appear, then shrink as the temperature rises.',
+    text: 'If something changes, such as adding greenhouse gases, the planet is briefly out of balance: more energy arrives than leaves. The extra energy warms the planet until balance returns. The equation above the planet adds up the energy reaching and leaving the surface. Raise the greenhouse strength and watch it go out of balance, then settle as the temperature rises.',
     eq: 'Heat capacity × (rate of warming) = energy in − energy out',
-    params: {}, view: V({}),
+    params: {}, view: V({ equation: true }),
     slider: { key: 'eps', min: 0.5, max: 1, step: 0.01, decimals: 2, label: 'Greenhouse strength ε', unit: '' } },
   { title: 'Ice can tip the balance',
     text: 'A colder planet has more ice, and ice reflects more sunlight, which makes it colder still. This feedback can tip a planet into a “Snowball Earth”. Lower the sunlight below about 1230 W/m² to freeze it. Then try raising it again: escaping is much harder than falling in.',
@@ -171,14 +188,15 @@ const STEPS = [
 
 function currentView() {
   if (SIM.mode === 'explain') return STEPS[SIM.step].view;
-  return V({ arrows: SIM.showArrows ? ALL_ARROWS : [] });
+  return V({ arrows: SIM.showArrows ? ALL_ARROWS : [], equation: SIM.showBudget });
 }
 
 function applyStep(i) {
   SIM.step = Math.max(0, Math.min(STEPS.length - 1, i));
-  const wasAtm = SIM.params.atmosphere;
+  const wasEmitting = SIM.params.atmosphere && SIM.params.atmEmit;
   Object.assign(SIM.params, DEFAULTS, STEPS[SIM.step].params, { speed: 2 });
-  if (!wasAtm && SIM.params.atmosphere) SIM.Ta = SIM.Ts * Math.pow(2, -0.25);
+  // an atmosphere that starts emitting begins in balance with the current surface temperature
+  if (!wasEmitting && SIM.params.atmosphere && SIM.params.atmEmit) SIM.Ta = SIM.Ts * Math.pow(2, -0.25);
 }
 
 function enterExplainer() { resetSim(); SIM.mode = 'explain'; applyStep(0); }
@@ -484,10 +502,10 @@ AFRAME.registerComponent('planet-system', {
     // Energy-budget arrows: width proportional to each flux
     const nrm = (x, y, z) => new THREE.Vector3(x, y, z).normalize();
     this.dirs = { in: nrm(-0.85, 0.35, 0.4), refl: nrm(-0.75, -0.35, 0.55),
-                  surf: nrm(0.55, 0.55, 0.62), back: nrm(0.75, -0.35, 0.56) };
+                  surf: nrm(0.55, 0.55, 0.62), back: nrm(0.75, -0.35, 0.56), up: nrm(0.95, 0.12, 0.3) };
     this.arrows = {};
     const mk = (key, color) => { const a = new FluxArrow(color); g.add(a.mesh); g.add(a.label); this.arrows[key] = a; };
-    mk('in', COL.sun); mk('refl', COL.reflected); mk('surf', COL.surfIR); mk('back', COL.atmIR); mk('olr', '#ffb07a');
+    mk('in', COL.sun); mk('refl', COL.reflected); mk('surf', COL.surfIR); mk('back', COL.atmIR); mk('trans', COL.surfIR); mk('up', COL.atmIR);
     this.camLocal = new THREE.Vector3();
 
     // Invisible sphere that the controller / mouse ray can hit, so the planet can be grabbed
@@ -552,11 +570,12 @@ AFRAME.registerComponent('planet-system', {
     A.refl.set(show('refl'), f.reflected, tmp.copy(d.refl).multiplyScalar(R * 1.02), d.refl, 0.9, true, cam, 1);
     if (atm) {
       A.surf.set(show('surf'), f.surfIR, tmp.copy(d.surf).multiplyScalar(R * 1.02), d.surf, RA - R * 1.02, false, cam, 0.5);
-      A.olr.set(show('olr'), f.olr, tmp.copy(d.surf).multiplyScalar(RA), d.surf, 0.75, true, cam, 1);
-      A.back.set(show('back'), f.back, tmp.copy(d.back).multiplyScalar(RA), d.back.clone().negate(), RA - R * 1.02, true, cam, -0.1);
+      A.trans.set(show('trans'), f.trans, tmp.copy(d.surf).multiplyScalar(RA), d.surf, 0.75, true, cam, 1);
+      A.up.set(show('up') && view.atmEmit, f.atmUp, tmp.copy(d.up).multiplyScalar(RA), d.up, 0.7, true, cam, 1);
+      A.back.set(show('back') && view.atmEmit, f.back, tmp.copy(d.back).multiplyScalar(RA), d.back.clone().negate(), RA - R * 1.02, true, cam, -0.1);
     } else {
       A.surf.set(show('surf'), f.surfIR, tmp.copy(d.surf).multiplyScalar(R * 1.02), d.surf, 1.0, true, cam, 1);
-      A.olr.set(false); A.back.set(false);
+      A.trans.set(false); A.up.set(false); A.back.set(false);
     }
   },
 
@@ -566,7 +585,7 @@ AFRAME.registerComponent('planet-system', {
     const R = this.R, RA = this.RA, RMAX = this.RMAX;
 
     this.earth.rotation.y += dt * 0.1;
-    const edge = iceEdgeLat(SIM.Ts);
+    const edge = displayIceEdge();
     if (Math.abs(edge - this.lastEdge) > 0.4) { drawIce(this.E, edge); this.lastEdge = edge; }
     const view = currentView(); this.view = view;
     this.shell.visible = p.atmosphere && view.shell;
@@ -631,6 +650,8 @@ AFRAME.registerComponent('planet-system', {
       this.px[i] = x; this.py[i] = y; this.pz[i] = z;
     }
 
+    // Streak size scales with its stream's flux (relative to present-day values) so changes are easy to see
+    const sz = [f.Q / 340, f.reflected / 102, f.surfIR / 392, f.back / 153, f.back / 153].map(v => clamp(v, 0.15, 3));
     // Write instance transforms and colours
     for (let i = 0; i < this.n; i++) {
       const t = this.ty[i], x = this.px[i], y = this.py[i], z = this.pz[i];
@@ -638,7 +659,8 @@ AFRAME.registerComponent('planet-system', {
       this.q.setFromUnitVectors(this.UP, this.v3);
       let s = 1;
       if (t === 1 || t === 2 || t === 3) s = clamp((RMAX - Math.hypot(x, y, z)) / 0.5, 0, 1);
-      this.m.compose(this.p3.set(x, y, z), this.q, this.s3.set(s, s, s));
+      const k = sz[t];
+      this.m.compose(this.p3.set(x, y, z), this.q, this.s3.set(s * k, s * Math.sqrt(k), s * k));
       this.pmesh.setMatrixAt(i, this.m);
       this.pmesh.setColorAt(i, this.cols[t]);
     }
@@ -697,7 +719,7 @@ AFRAME.registerComponent('info-display', {
     c.fillText('PLANETARY ENERGY BALANCE', 40, 56);
     c.fillStyle = '#b9c7da'; c.font = `26px ${FONT}`;
     c.fillText(p.atmosphere ? `One-layer atmosphere, ε = ${p.eps.toFixed(2)}` : 'No atmosphere (bare planet)', 40, 98);
-    c.fillText(p.iceFeedback ? 'Ice–albedo feedback ON' : 'Ice–albedo feedback off (ice is visual only)', 40, 132);
+    c.fillText(p.iceFeedback ? 'Ice feedback ON: temperature sets the ice, ice sets the albedo' : 'Ice feedback off: the albedo slider sets the ice cover', 40, 132);
 
     const Tc = SIM.Ts - 273.15;
     c.fillStyle = COL.muted; c.font = `28px ${FONT}`; c.fillText('Surface temperature', 40, 196);
@@ -769,7 +791,8 @@ AFRAME.registerComponent('ui-slider', {
             step: { type: 'number', default: 1 }, decimals: { type: 'int', default: 0 },
             label: { type: 'string' }, unit: { type: 'string', default: '' },
             width: { type: 'number', default: 0.56 }, enabledIf: { type: 'string', default: '' },
-            dynamic: { type: 'boolean', default: false } },
+            dynamic: { type: 'boolean', default: false },
+            iceLabel: { type: 'string', default: '' } },   // label and effective-albedo marker used when ice feedback is on
   init: function () {
     const d = this.data, w = d.width, o = new THREE.Group();
     const basic = (col, opts) => new THREE.MeshBasicMaterial(Object.assign({ color: col, transparent: true }, opts || {}));
@@ -797,7 +820,10 @@ AFRAME.registerComponent('ui-slider', {
       holdLook(this.cursorEl, () => { this.dragging = false; });
     });
   },
-  enabled: function () { return !this.data.enabledIf || !!SIM.params[this.data.enabledIf]; },
+  enabled: function () {
+    if (this.data.iceLabel && SIM.params.iceFeedback) return false;   // albedo is set by the ice
+    return !this.data.enabledIf || !!SIM.params[this.data.enabledIf];
+  },
   setFromHit: function (hit) {
     if (!hit) return;
     const d = this.data, lp = this.el.object3D.worldToLocal(hit.point.clone());
@@ -819,20 +845,25 @@ AFRAME.registerComponent('ui-slider', {
     if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
       this.setFromHit(this.cursorEl.components.raycaster.getIntersection(this.el));
     }
-    const v = SIM.params[d.key], frac = (v - d.min) / (d.max - d.min), en = this.enabled();
+    const gauge = !!d.iceLabel && SIM.params.iceFeedback;
+    const v = gauge ? SIM.f.a : SIM.params[d.key], frac = clamp((v - d.min) / (d.max - d.min), 0, 1), en = this.enabled();
     this.knob.position.x = -d.width / 2 + frac * d.width;
     this.fill.scale.x = Math.max(frac, 0.0001);
-    const a = en ? 1 : 0.3;
+    const a = en ? 1 : gauge ? 0.75 : 0.3;
     this.trackMat.opacity = a; this.fillMat.opacity = a; this.knobMat.opacity = a; this.label.mat.opacity = a;
-    this.knobMat.color.set(en && (this.hover || this.dragging) ? '#ffd166' : '#eef3f8');
+    this.knobMat.color.set(gauge ? '#7cc4ff' : en && (this.hover || this.dragging) ? '#ffd166' : '#eef3f8');
     this.knob.scale.setScalar(en && (this.hover || this.dragging) ? 1.25 : 1);
-    const txt = `${d.label}|${v.toFixed(d.decimals)} ${d.unit}|${d.min}|${d.max}`;
+    const ice = gauge;
+    const lbl = ice ? d.iceLabel : d.label;
+    const valTxt = ice ? v.toFixed(d.decimals) : `${v.toFixed(d.decimals)} ${d.unit}`;
+    const txt = `${lbl}|${valTxt}|${d.min}|${d.max}`;
     if (txt !== this.drawn) {
       this.drawn = txt;
       const c = this.label.ctx; c.clearRect(0, 0, 640, 52);
       c.textBaseline = 'middle'; c.fillStyle = COL.text;
-      c.font = `30px ${FONT}`; c.textAlign = 'left'; c.fillText(d.label, 2, 28);
-      c.font = `700 30px ${FONT}`; c.textAlign = 'right'; c.fillText(`${v.toFixed(d.decimals)} ${d.unit}`, 638, 28);
+      c.font = `30px ${FONT}`; c.textAlign = 'left'; c.fillText(lbl, 2, 28);
+      c.font = `700 30px ${FONT}`; c.textAlign = 'right';
+      c.fillStyle = ice ? '#7cc4ff' : COL.text; c.fillText(valTxt, 638, 28);
       this.label.tex.needsUpdate = true;
     }
   }
@@ -997,6 +1028,57 @@ AFRAME.registerComponent('explain-title', {
   }
 });
 
+
+// ---------- Live energy equation floating above the planet ----------
+AFRAME.registerComponent('budget-board', {
+  init: function () {
+    this.c = makeCanvasPlane(1.8, 1600, 440); this.el.object3D.add(this.c.mesh); this.last = 0;
+    this.cam = new THREE.Vector3(); this.me = new THREE.Vector3();
+  },
+  tick: function (t) {
+    const o = this.el.object3D;
+    o.visible = !!currentView().equation;
+    if (!o.visible) return;
+    this.el.sceneEl.camera.getWorldPosition(this.cam); o.getWorldPosition(this.me);
+    const pq = o.parent.getWorldQuaternion(new THREE.Quaternion());
+    o.rotation.y = Math.atan2(this.cam.x - this.me.x, this.cam.z - this.me.z) - new THREE.Euler().setFromQuaternion(pq, 'YXZ').y;
+    if (t - this.last < 100) return;
+    this.last = t;
+    const c = this.c.ctx, f = SIM.f, atm = SIM.params.atmosphere;
+    c.clearRect(0, 0, 1600, 440);
+    c.fillStyle = 'rgba(13,23,38,0.92)'; roundRect(c, 0, 0, 1600, 440, 34); c.fill();
+    c.strokeStyle = 'rgba(143,163,191,0.4)'; c.lineWidth = 3; roundRect(c, 2, 2, 1596, 436, 34); c.stroke();
+    c.textBaseline = 'alphabetic'; c.textAlign = 'center';
+    c.fillStyle = COL.muted; c.font = `700 34px ${FONT}`;
+    c.fillText('ENERGY IN − ENERGY OUT AT THE SURFACE (W/m²)', 800, 62);
+    // terms: [sign, value, colour, caption]
+    const terms = [['', f.absorbed, COL.sun, 'sunlight absorbed']];
+    if (atm) terms.push(['+', f.back, COL.atmIR, 'back-radiation']);
+    terms.push(['−', f.surfIR, COL.surfIR, 'infrared emitted']);
+    const net = f.surfNet, bal = Math.abs(net) < 0.05;
+    const netCol = bal ? '#7ee0a0' : net > 0 ? '#ff8a6b' : '#7cc4ff';
+    const items = [];
+    terms.forEach(tm => { if (tm[0]) items.push({ txt: tm[0], col: COL.text, cap: '' }); items.push({ txt: tm[1].toFixed(0), col: tm[2], cap: tm[3] }); });
+    items.push({ txt: '=', col: COL.text, cap: '' });
+    items.push({ txt: (bal ? '' : net > 0 ? '+' : '−') + Math.abs(net).toFixed(1), col: netCol, cap: 'net' });
+    c.font = `700 84px ${FONT}`;
+    const gap = 34, widths = items.map(it => Math.max(c.measureText(it.txt).width, it.cap ? 180 : 0));
+    let x = 800 - (widths.reduce((a, b) => a + b, 0) + gap * (items.length - 1)) / 2;
+    items.forEach((it, k) => {
+      const cx = x + widths[k] / 2;
+      c.font = `700 84px ${FONT}`; c.fillStyle = it.col; c.fillText(it.txt, cx, 196);
+      if (it.cap) { c.font = `26px ${FONT}`; c.fillStyle = COL.muted; c.fillText(it.cap, cx, 238); }
+      x += widths[k] + gap;
+    });
+    c.font = `700 44px ${FONT}`; c.fillStyle = netCol;
+    c.fillText(bal ? 'Balanced: temperature steady' :
+      `Surface ${net > 0 ? 'warming' : 'cooling'} at ${Math.abs(f.rate).toFixed(2)} °C per year`, 800, 318);
+    c.font = `28px ${FONT}`; c.fillStyle = '#b9c7da';
+    c.fillText(`Top of atmosphere: ${f.Q.toFixed(0)} in − ${f.reflected.toFixed(0)} reflected − ${f.olr.toFixed(0)} infrared out = ${f.imbalance >= 0 ? '+' : '−'}${Math.abs(f.imbalance).toFixed(1)}`, 800, 392);
+    this.c.tex.needsUpdate = true;
+  }
+});
+
 // ---------- Scene background changes in explainer mode ----------
 AFRAME.registerComponent('mode-manager', {
   tick: function () {
@@ -1025,7 +1107,8 @@ AFRAME.registerComponent('auto-height', {
 AFRAME.registerComponent('ui-button', {
   schema: { action: { type: 'string' }, width: { type: 'number', default: 0.27 } },
   init: function () {
-    this.c = makeCanvasPlane(this.data.width, 512, 124);
+    this.W = Math.round(512 * this.data.width / 0.27);   // wider buttons get a wider canvas, same height
+    this.c = makeCanvasPlane(this.data.width, this.W, 124);
     const grp = new THREE.Group(); grp.add(this.c.mesh);
     this.el.setObject3D('ui', grp);
     this.hover = false; this.drawn = '';
@@ -1035,10 +1118,11 @@ AFRAME.registerComponent('ui-button', {
       const p = SIM.params;
       switch (this.data.action) {
         case 'atmosphere': setAtmosphere(!p.atmosphere); break;
-        case 'ice': p.iceFeedback = !p.iceFeedback; break;
+        case 'ice': p.iceFeedback = !p.iceFeedback; if (p.iceFeedback) p.albedo = DEFAULTS.albedo; break;
         case 'pause': p.paused = !p.paused; break;
         case 'reset': resetSim(); this.el.sceneEl.emit('reset-poses'); break;
         case 'arrows': SIM.showArrows = !SIM.showArrows; break;
+        case 'budget': SIM.showBudget = !SIM.showBudget; break;
         case 'explain': copyPose('#panel', '#explainer'); enterExplainer(); break;
         case 'prev': applyStep(SIM.step - 1); break;
         case 'next': if (SIM.step < STEPS.length - 1) applyStep(SIM.step + 1); else { copyPose('#explainer', '#panel'); exitExplainer(); } break;
@@ -1054,6 +1138,7 @@ AFRAME.registerComponent('ui-button', {
       case 'ice': return [`Ice–albedo feedback: ${p.iceFeedback ? 'ON' : 'OFF'}`, p.iceFeedback];
       case 'pause': return [p.paused ? '▶  Resume' : '❚❚  Pause', p.paused];
       case 'arrows': return [`Budget arrows: ${SIM.showArrows ? 'ON' : 'OFF'}`, SIM.showArrows];
+      case 'budget': return [`Energy equation: ${SIM.showBudget ? 'ON' : 'OFF'}`, SIM.showBudget];
       case 'explain': return ['Explain step by step  ▶', true];
       case 'prev': return ['◀  Back', false];
       case 'next': return [SIM.step < STEPS.length - 1 ? 'Next  ▶' : 'Finish  ✓', true];
@@ -1071,14 +1156,14 @@ AFRAME.registerComponent('ui-button', {
     const key = label + active + this.hover;
     if (key === this.drawn) return;
     this.drawn = key;
-    const c = this.c.ctx;
-    c.clearRect(0, 0, 512, 124);
+    const c = this.c.ctx, W = this.W;
+    c.clearRect(0, 0, W, 124);
     c.fillStyle = active ? (this.hover ? '#3a86b8' : '#2a6f97') : (this.hover ? '#2c3e55' : '#1b2738');
-    roundRect(c, 4, 4, 504, 116, 22); c.fill();
+    roundRect(c, 4, 4, W - 8, 116, 22); c.fill();
     c.strokeStyle = this.hover ? '#ffd166' : 'rgba(143,163,191,0.4)'; c.lineWidth = 4;
-    roundRect(c, 4, 4, 504, 116, 22); c.stroke();
+    roundRect(c, 4, 4, W - 8, 116, 22); c.stroke();
     c.fillStyle = COL.text; c.font = `600 32px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
-    c.fillText(label, 256, 64);
+    c.fillText(label, W / 2, 64);
     this.c.tex.needsUpdate = true;
   }
 });
@@ -1123,19 +1208,20 @@ AFRAME.registerComponent('ui-button', {
                     position="1.5 0.05 0.2"></a-entity>
 
           <a-entity explain-title position="0 1.15 0"></a-entity>
+          <a-entity budget-board position="0 1.55 0"></a-entity>
         </a-entity>
 
         <!-- Main control panel -->
-        <a-entity id="panel" mode-visible="mode: main" position="0.6 1.0 -1.3" rotation="-35 -28 0">
+        <a-entity id="panel" mode-visible="mode: main" position="0.6 1.05 -1.3" rotation="-35 -28 0">
           <a-entity grab-move="target: #panel; label: Grab here to move panel; width: 0.6" position="0 0.38 0.002"></a-entity>
-          <a-plane width="1.46" height="0.78" position="0 -0.05 -0.004" material="shader: flat; color: #2a3b55"></a-plane>
-          <a-plane width="1.44" height="0.76" position="0 -0.05 -0.002" material="shader: flat; color: #0b1320"></a-plane>
+          <a-plane width="1.46" height="0.87" position="0 -0.095 -0.004" material="shader: flat; color: #2a3b55"></a-plane>
+          <a-plane width="1.44" height="0.85" position="0 -0.095 -0.002" material="shader: flat; color: #0b1320"></a-plane>
 
           <a-entity info-display position="-0.33 0 0.001"></a-entity>
 
           <a-entity ui-slider="key: S0; min: 800; max: 2000; step: 1; decimals: 0; label: Solar constant S₀; unit: W/m²"
                     position="0.36 0.245 0.002"></a-entity>
-          <a-entity ui-slider="key: albedo; min: 0; max: 0.9; step: 0.01; decimals: 2; label: Albedo α"
+          <a-entity ui-slider="key: albedo; min: 0; max: 0.9; step: 0.01; decimals: 2; label: Albedo α; iceLabel: Albedo α (set by ice cover)"
                     position="0.36 0.15 0.002"></a-entity>
           <a-entity ui-slider="key: eps; min: 0; max: 1; step: 0.01; decimals: 2; label: Greenhouse emissivity ε; enabledIf: atmosphere"
                     position="0.36 0.055 0.002"></a-entity>
@@ -1145,9 +1231,10 @@ AFRAME.registerComponent('ui-button', {
           <a-entity ui-button="action: atmosphere" position="0.215 -0.135 0.002"></a-entity>
           <a-entity ui-button="action: ice" position="0.505 -0.135 0.002"></a-entity>
           <a-entity ui-button="action: arrows" position="0.215 -0.225 0.002"></a-entity>
-          <a-entity ui-button="action: pause" position="0.505 -0.225 0.002"></a-entity>
-          <a-entity ui-button="action: explain" position="0.215 -0.315 0.002"></a-entity>
+          <a-entity ui-button="action: budget" position="0.505 -0.225 0.002"></a-entity>
+          <a-entity ui-button="action: pause" position="0.215 -0.315 0.002"></a-entity>
           <a-entity ui-button="action: reset" position="0.505 -0.315 0.002"></a-entity>
+          <a-entity ui-button="action: explain; width: 0.56" position="0.36 -0.405 0.002"></a-entity>
         </a-entity>
 
         <!-- Explainer panel (shown only in explainer mode) -->
