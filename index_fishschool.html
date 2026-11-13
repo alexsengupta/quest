@@ -879,7 +879,7 @@ const MAXN = 1000;
 
 // 2D tank: same settings and presets as the original 2D app (world units; 8 units = one body length)
 const BL2 = 8;
-const P2 = { sep: 1.5, ali: 1.0, coh: 1.0, R: 48, Rsep: 24, n: 70, preds: 0, speed: 1, paused: false };
+const P2 = { sep: 1.5, ali: 1.0, coh: 1.0, R: 48, Rsep: 24, n: 70, preds: 0, speed: 1, paused: false, tilt: 25 };
 const PRESETS2 = {
   balanced: { sep: 1.5, ali: 1.0, coh: 1.0, R: 48, Rsep: 24, preds: 0, name: 'Balanced',
               text: 'Balanced rules. Fish gather into a few schools that each swim in one direction, and merge or split as they meet.' },
@@ -892,7 +892,7 @@ const PRESETS2 = {
   attack:   { sep: 1.5, ali: 1.0, coh: 1.2, R: 56, Rsep: 24, preds: 2, name: 'Under attack',
               text: 'The balanced school plus two predators (orange). Watch the school split around a predator and then reform.' }
 };
-const TANK = { W: 600, H: 360, w: 2.4, d: 1.44 };   // model world (units) and table top (metres); edges wrap
+const TANK = { W: 600, H: 360, w: 3.0, d: 1.8 };   // model world (units) and table top (metres); edges wrap
 const SIM2 = { model: null, preset: 'balanced', acc: 0, px: new Float32Array(1024), py: new Float32Array(1024),
                tour: { step: 0, model: null, playing: false, playLeft: 0, cx: 500, cy: 500, drag: -1 } };
 
@@ -1416,7 +1416,9 @@ AFRAME.registerComponent('ui-slider', {
   }
 });
 
-// ---------- Grab handle: point at it and hold the trigger to move the panel ----------
+function isShown(o) { for (; o; o = o.parent) if (!o.visible) return false; return true; }
+
+// ---------- Grab handle: point at it and hold the trigger to move a panel (or the tank) ----------
 AFRAME.registerComponent('grab-move', {
   schema: { target: { type: 'selector' }, label: { type: 'string', default: '' }, width: { type: 'number', default: 0.6 } },
   init: function () {
@@ -1441,7 +1443,7 @@ AFRAME.registerComponent('grab-move', {
     });
   },
   tick: function () {
-    setClickable(this.el, panelActive(this.el));
+    setClickable(this.el, panelActive(this.el) && isShown(this.el.object3D));
     if (this.dragging && this.cursorEl && this.cursorEl.components.raycaster) {
       const ray = this.cursorEl.components.raycaster.raycaster.ray;
       const tg = this.data.target.object3D, parent = tg.parent;
@@ -1504,7 +1506,8 @@ const BUTTONS = {
   // tour
   prev:    ['◀  Back', () => tourGo(SIM2.tour.step - 1)],
   next:    [() => SIM2.tour.step < STEPS.length - 1 ? 'Next  ▶' : 'Go to the tank  ✓', () => tourGo(SIM2.tour.step + 1)],
-  play:    [() => SIM2.tour.playing ? 'Playing…' : '▶  Play the group', () => { const t = SIM2.tour; if (!t.playing) { t.playing = true; t.playLeft = 240; } }],
+  play:    [() => SIM2.tour.playing ? 'Playing…' : (SIM2.tour.model && SIM2.tour.model.t > 0 ? '▶  Play again' : '▶  Play the group'),
+            () => { const t = SIM2.tour; if (t.playing) return; if (t.model.t > 0) tourBuild(); t.playing = true; t.playLeft = 360; }],   // every run starts from the same positions
   regroup: ['↺  Reset group', () => { tourBuild(); }],
   exit:    ['✕  Exit', () => { SIM2.tour.playing = false; setMode('tank'); }]
 };
@@ -1563,6 +1566,45 @@ AFRAME.registerComponent('ui-button', {
     c.fillStyle = COL.text; c.textAlign = 'center'; c.textBaseline = 'middle';
     c.fillText(label, W / 2, 64);
     this.c.tex.needsUpdate = true;
+  }
+});
+
+// ---------- Moving yourself with the thumbsticks ----------
+// Left stick: glide in the direction you are looking. Right stick: snap turn 30° (around your head, so you stay put).
+AFRAME.registerComponent('stick-move', {
+  init: function () {
+    this.rig = document.querySelector('#rig').object3D;
+    this.cam = document.querySelector('[camera]').object3D;
+    this.mv = [0, 0]; this.turnReady = true;
+    this.p0 = new THREE.Vector3(); this.p1 = new THREE.Vector3(); this.q = new THREE.Quaternion(); this.f = new THREE.Vector3();
+    document.querySelectorAll('[laser-controls]').forEach(c => {
+      const hand = c.getAttribute('laser-controls').hand;
+      c.addEventListener('thumbstickmoved', (e) => {
+        const x = e.detail.x, y = e.detail.y;
+        if (hand === 'left') { this.mv[0] = x; this.mv[1] = y; return; }
+        if (Math.abs(x) < 0.3) { this.turnReady = true; return; }
+        if (Math.abs(x) > 0.7 && this.turnReady) { this.turnReady = false; this.snap(x > 0 ? -1 : 1); }
+      });
+    });
+  },
+  snap: function (sgn) {
+    this.cam.getWorldPosition(this.p0);
+    this.rig.rotation.y += sgn * Math.PI / 6;
+    this.rig.updateMatrixWorld(true);
+    this.cam.getWorldPosition(this.p1);
+    this.rig.position.x += this.p0.x - this.p1.x; this.rig.position.z += this.p0.z - this.p1.z;
+  },
+  tick: function (t, dt) {
+    const x = this.mv[0], y = this.mv[1];
+    if (!dt || Math.hypot(x, y) < 0.15) return;
+    this.cam.getWorldQuaternion(this.q);
+    this.f.set(0, 0, -1).applyQuaternion(this.q); this.f.y = 0;
+    if (this.f.lengthSq() < 1e-6) return;
+    this.f.normalize();
+    const s = 1.5 * Math.min(dt, 100) / 1000;            // up to 1.5 m/s
+    // forward is -y on the stick; right is (-f.z, f.x)
+    this.rig.position.x += (this.f.x * -y + -this.f.z * x) * s;
+    this.rig.position.z += (this.f.z * -y + this.f.x * x) * s;
   }
 });
 
@@ -1711,7 +1753,7 @@ const STEPS = [
       : '<p>No neighbour is inside personal space, so there is <b>no separation push</b> this step. Drag a fish into the red circle to see one appear.</p>' },
   { title: 'Rule 2: Alignment',
     text: o => o.n > 0
-      ? '<p>The fish compares its own velocity (grey) with the <b>average velocity of its neighbours</b> (faint blue). The alignment push (blue arrow) is the <b>difference</b> between the two (thin line).</p><p>It is zero if the fish already swims like its neighbours, and larger the more out of step it is.</p>'
+      ? '<p>The fish compares its own velocity (grey) with the <b>average velocity of its neighbours</b> (faint blue). The alignment push (blue arrow) is the <b>difference</b> between the two (thin line).</p><p>It is zero if the fish already swims like its neighbours, and larger the more out of step it is. Alignment depends on <b>headings</b>, not positions, so here dragging a neighbour turns it round instead of moving it.</p>'
       : '<p>No neighbours, so nothing to align with.</p>' },
   { title: 'Rule 3: Cohesion',
     text: o => o.n > 0
@@ -1722,7 +1764,7 @@ const STEPS = [
   { title: 'Turning, gradually',
     text: (o, extra) => '<p>The overall push changes the fish’s velocity. The change per step is capped' + (extra.capped ? ' (the cap is active right now)' : '') + ', which acts like inertia, and the fish also drifts back towards its cruising speed.</p><p>So in one step its heading changes by only <b>' + extra.turn.toFixed(1) + '°</b>. The change is drawn 10× larger than reality so you can see it. This is why schools turn smoothly.</p>' },
   { title: 'Everyone at once',
-    text: () => '<p>Every fish does the same calculation from the <b>same snapshot</b>, then they all move together. The arrows show each fish’s overall push. (If fish moved one at a time, later fish would react to where others had already gone.)</p><p>Press <b>Play the group</b> to run this small group for a few seconds.</p>' },
+    text: () => '<p>Every fish does the same calculation from the <b>same snapshot</b>, then they all move together. The arrows show each fish’s overall push. (If fish moved one at a time, later fish would react to where others had already gone.)</p><p>Press <b>Play the group</b> to run this small group for a few seconds. Then change the weights and play again: every run starts from the same positions, so you can compare.</p>' },
   { title: 'Now scale it up',
     text: () => '<p>The tank applies exactly these rules to about a hundred fish. Its edges wrap around: a fish leaving one side comes back on the other, so there are no walls to complicate things.</p><p>Watch the <b>polarisation</b> plot: it measures how aligned the school is, from 0 (random headings) to 1 (everyone swimming the same way). Then try the presets, or go back to the 3D ocean to see the same rules all around you.</p>' }
 ];
@@ -1736,8 +1778,13 @@ AFRAME.registerComponent('tank-view', {
   init: function () {
     const o = this.el.object3D;
     // table and water
-    const table = new THREE.Mesh(new THREE.BoxGeometry(TANK.w + 0.12, 0.78, TANK.d + 0.12), new THREE.MeshLambertMaterial({ color: '#1d2b36' }));
-    table.position.y = -0.4; o.add(table);
+    o.rotation.order = 'YXZ';            // turn to face you, then tilt about the tank's own near-far axis
+    const tray = new THREE.Mesh(new THREE.BoxGeometry(TANK.w + 0.12, 0.05, TANK.d + 0.12), new THREE.MeshLambertMaterial({ color: '#1d2b36' }));
+    tray.position.y = -0.03; o.add(tray);
+    // a pedestal that stays upright however the tank is tilted or moved
+    const pg = new THREE.CylinderGeometry(0.08, 0.14, 1, 16); pg.translate(0, -0.5, 0);
+    this.ped = new THREE.Mesh(pg, new THREE.MeshLambertMaterial({ color: '#1d2b36' }));
+    this.pedGrp = new THREE.Group(); this.pedGrp.add(this.ped); this.pedGrp.position.y = -0.06; o.add(this.pedGrp);
     const wc = document.createElement('canvas'); wc.width = 8; wc.height = 256;
     const wx = wc.getContext('2d'), gr = wx.createLinearGradient(0, 0, 0, 256);
     gr.addColorStop(0, '#16506e'); gr.addColorStop(1, '#0a2433'); wx.fillStyle = gr; wx.fillRect(0, 0, 8, 256);
@@ -1764,6 +1811,12 @@ AFRAME.registerComponent('tank-view', {
   tick: function (t, dt) {
     const show = SIM.mode === 'tank' || SIM.mode === 'tour';
     this.el.object3D.visible = show;
+    if (show) {   // tilt the table top towards you; keep the pedestal vertical and reaching the floor
+      const o = this.el.object3D;
+      o.rotation.x = P2.tilt * Math.PI / 180;
+      this.pedGrp.rotation.x = -o.rotation.x;
+      this.ped.scale.y = Math.max(0.05, o.position.y - 0.08);
+    }
     if (!show || !dt) return;
     const s = Math.min(dt, 100) / 1000;
     if (SIM.mode === 'tank') this.runTank(s); else this.runTour(s);
@@ -1957,6 +2010,7 @@ AFRAME.registerComponent('tank-hit', {
       if (SIM.mode === 'tank') { SIM2.model.scare(w[0], w[1]); return; }
       const tr = SIM2.tour;
       if (SIM.mode !== 'tour' || !DRAG_STEPS[tr.step] || tr.playing) return;
+      this.turnOnly = tr.step === 3;     // alignment step: dragging turns a fish instead of moving it
       let best = -1, bd = (BL2 * 2.5) ** 2;
       for (let i = 0; i < tr.model.n; i++) { const d2 = (tr.model.x[i] - w[0]) ** 2 + (tr.model.y[i] - w[1]) ** 2; if (d2 < bd) { bd = d2; best = i; } }
       if (best < 0) return;
@@ -1970,7 +2024,11 @@ AFRAME.registerComponent('tank-hit', {
     if (SIM.mode !== 'tour' || tr.drag < 0 || !this.cursorEl || !this.cursorEl.components.raycaster) return;
     const hit = this.cursorEl.components.raycaster.getIntersection(this.el); if (!hit) return;
     const lp = this.el.object3D.worldToLocal(hit.point.clone()), w = this.view().toWorld(lp.x, lp.z);
-    tr.model.x[tr.drag] = w[0]; tr.model.y[tr.drag] = w[1];
+    const m = tr.model, j = tr.drag;
+    if (this.turnOnly) {          // point the fish at the pointer, keeping its speed
+      const dx = w[0] - m.x[j], dy = w[1] - m.y[j], d = Math.hypot(dx, dy), s = Math.hypot(m.vx[j], m.vy[j]) || Flat.FIX.maxSpeed;
+      if (d > BL2 * 0.5) { m.vx[j] = dx / d * s; m.vy[j] = dy / d * s; }
+    } else { m.x[j] = w[0]; m.y[j] = w[1]; }
   }
 });
 
@@ -2033,7 +2091,8 @@ AFRAME.registerComponent('explain-display', {
     const y = drawRich(c, st.text(tourForces(0), tourStepInfo()), 40, 172, 944, 29, 39, '#d5deea', '#ffffff');
     if (DRAG_STEPS[tr.step]) {
       c.fillStyle = COL.muted; c.font = `italic 25px ${FONT}`;
-      c.fillText('Tip: point at any fish and hold the trigger to drag it. Everything updates at once.', 40, Math.min(H - 24, Math.max(y, 520)));
+      c.fillText(tr.step === 3 ? 'Tip: point at a neighbour, hold the trigger and move the pointer to turn it round.'
+                               : 'Tip: point at any fish and hold the trigger to drag it. Everything updates at once.', 40, Math.min(H - 24, Math.max(y, 520)));
     }
     this.c.tex.needsUpdate = true;
   }
@@ -2072,8 +2131,9 @@ AFRAME.registerComponent('explain-display', {
         <a-entity fish-school></a-entity>
 
         <!-- The 2D tank on its table (shown in the tank and tour views) -->
-        <a-entity tank-view position="0 0.82 -1.2">
+        <a-entity id="tank" tank-view position="0 1.05 -2.0">
           <a-entity tank-hit position="0 0.07 0"></a-entity>
+          <a-entity grab-move="target: #tank; label: Grab here to move the tank; width: 0.7" position="0 0.07 0.98"></a-entity>
         </a-entity>
 
         <!-- A small platform under your feet, which helps with comfort in VR -->
@@ -2112,9 +2172,9 @@ AFRAME.registerComponent('explain-display', {
         <!-- 2D tank panel -->
         <a-entity id="panel2" mode-visible="mode: tank" position="1.25 1.15 -0.55" rotation="-22 -58 0">
           <a-entity grab-move="target: #panel2; label: Grab here to move panel; width: 0.6" position="0 0.52 0.002"></a-entity>
-          <a-plane width="1.46" height="0.975" position="0 -0.008 -0.004" material="shader: flat; color: #2a3b55; fog: false"></a-plane>
-          <a-plane width="1.44" height="0.955" position="0 -0.008 -0.002" material="shader: flat; color: #0b1320; fog: false"></a-plane>
-          <a-entity tank-info position="-0.355 -0.007 0.001"></a-entity>
+          <a-plane width="1.46" height="1.055" position="0 -0.047 -0.004" material="shader: flat; color: #2a3b55; fog: false"></a-plane>
+          <a-plane width="1.44" height="1.035" position="0 -0.047 -0.002" material="shader: flat; color: #0b1320; fog: false"></a-plane>
+          <a-entity tank-info position="-0.355 -0.047 0.001"></a-entity>
           <a-entity ui-slider="obj: P2; key: sep; min: 0; max: 3; step: 0.1; decimals: 1; label: Separation" position="0.36 0.420 0.002"></a-entity>
           <a-entity ui-slider="obj: P2; key: ali; min: 0; max: 3; step: 0.1; decimals: 1; label: Alignment" position="0.36 0.345 0.002"></a-entity>
           <a-entity ui-slider="obj: P2; key: coh; min: 0; max: 3; step: 0.1; decimals: 1; label: Cohesion" position="0.36 0.270 0.002"></a-entity>
@@ -2123,16 +2183,17 @@ AFRAME.registerComponent('explain-display', {
           <a-entity ui-slider="obj: P2; key: n; min: 10; max: 300; step: 10; label: Number of fish; rule: false" position="0.36 0.045 0.002"></a-entity>
           <a-entity ui-slider="obj: P2; key: preds; min: 0; max: 4; step: 1; label: Predators; rule: false" position="0.36 -0.030 0.002"></a-entity>
           <a-entity ui-slider="obj: P2; key: speed; min: 0.25; max: 3; step: 0.25; decimals: 2; label: Simulation speed; unit: ×; rule: false" position="0.36 -0.105 0.002"></a-entity>
-          <a-entity ui-button="action: p2:balanced; width: 0.18" position="0.170 -0.190 0.002"></a-entity>
-          <a-entity ui-button="action: p2:swarm; width: 0.18" position="0.360 -0.190 0.002"></a-entity>
-          <a-entity ui-button="action: p2:parallel; width: 0.18" position="0.550 -0.190 0.002"></a-entity>
-          <a-entity ui-button="action: p2:loners; width: 0.18" position="0.170 -0.275 0.002"></a-entity>
-          <a-entity ui-button="action: p2:attack; width: 0.18" position="0.360 -0.275 0.002"></a-entity>
-          <a-entity ui-button="action: pause2; width: 0.18" position="0.550 -0.275 0.002"></a-entity>
-          <a-entity ui-button="action: reset2; width: 0.18" position="0.170 -0.360 0.002"></a-entity>
-          <a-entity ui-button="action: explain; width: 0.37" position="0.455 -0.360 0.002"></a-entity>
-          <a-entity ui-button="action: toOcean; width: 0.37" position="0.265 -0.445 0.002"></a-entity>
-          <a-entity ui-button="action: hide; width: 0.18" position="0.550 -0.445 0.002"></a-entity>
+          <a-entity ui-slider="obj: P2; key: tilt; min: 0; max: 60; step: 5; label: Tilt the tank towards you; unit: °; rule: false" position="0.36 -0.180 0.002"></a-entity>
+          <a-entity ui-button="action: p2:balanced; width: 0.18" position="0.170 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: p2:swarm; width: 0.18" position="0.360 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: p2:parallel; width: 0.18" position="0.550 -0.265 0.002"></a-entity>
+          <a-entity ui-button="action: p2:loners; width: 0.18" position="0.170 -0.350 0.002"></a-entity>
+          <a-entity ui-button="action: p2:attack; width: 0.18" position="0.360 -0.350 0.002"></a-entity>
+          <a-entity ui-button="action: pause2; width: 0.18" position="0.550 -0.350 0.002"></a-entity>
+          <a-entity ui-button="action: reset2; width: 0.18" position="0.170 -0.435 0.002"></a-entity>
+          <a-entity ui-button="action: explain; width: 0.37" position="0.455 -0.435 0.002"></a-entity>
+          <a-entity ui-button="action: toOcean; width: 0.37" position="0.265 -0.520 0.002"></a-entity>
+          <a-entity ui-button="action: hide; width: 0.18" position="0.550 -0.520 0.002"></a-entity>
         </a-entity>
 
         <!-- Tour panel -->
@@ -2156,6 +2217,7 @@ AFRAME.registerComponent('explain-display', {
       <!-- Camera and Quest controllers (laser pointers; grip = scare fish) -->
       <a-entity id="rig">
         <a-entity camera look-controls wasd-controls="acceleration: 20" position="0 1.6 0"></a-entity>
+        <a-entity stick-move></a-entity>
         <a-entity laser-controls="hand: left" hand-threat raycaster="objects: .clickable; far: 8; lineColor: #9fd3ff; lineOpacity: 0.7"></a-entity>
         <a-entity laser-controls="hand: right" hand-threat raycaster="objects: .clickable; far: 8; lineColor: #9fd3ff; lineOpacity: 0.7"></a-entity>
       </a-entity>
